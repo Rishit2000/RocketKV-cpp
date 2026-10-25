@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# RocketKV-llama: Systematic Benchmarking Script for Apple Silicon
+# All benchmark parameters are maintained in declarative JSON configs in configs/
+# ==============================================================================
+
+set -e
+
+MODEL_PATH=${1:-"Llama-3.2-3B-Instruct.gguf"}
+EXTRA_ARGS=${2:-""}
+
+PYTHON=${PYTHON:-python3}
+if ! "$PYTHON" --version >/dev/null 2>&1; then
+  PYTHON="/usr/bin/python3"
+fi
+
+echo "================================================================================"
+echo " RocketKV on Consumer Edge Hardware - Systematic Benchmark Suite"
+echo " Target Model: $MODEL_PATH"
+echo " Python Interpreter: $PYTHON"
+echo "================================================================================"
+
+# 1. LongBench Benchmark Suite (Full-KV vs Quantized-KV vs RocketKV)
+echo ""
+echo "=== Running LongBench Benchmark Suite (configs/longbench.json) ==="
+"$PYTHON" eval.py configs/longbench.json
+
+echo ""
+echo "================================================================================"
+echo " Benchmarks completed. Results stored in results/ directory."
+echo "================================================================================"
+

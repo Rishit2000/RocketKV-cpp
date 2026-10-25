@@ -1,0 +1,43 @@
+{
+  "model": {
+    "path": "Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "runner": "./runner",
+    "max_tokens": 32,
+    "n_ctx": 9216
+  },
+  "benchmark": {
+    "suite": "longbench",
+    "tasks": [
+      "hotpotqa",
+      "2wikimqa",
+      "musique",
+      "qasper",
+      "multifieldqa_en",
+      "narrativeqa",
+      "gov_report",
+      "qmsum",
+      "multi_news",
+      "triviaqa",
+      "samsum",
+      "trec",
+      "passage_retrieval_en",
+      "passage_count",
+      "lcc",
+      "repobench-p"
+    ],
+    "context_len": 8192,
+    "num_samples": -1
+  },
+  "attention": {
+    "attn_type": "all",
+    "kv_type": "q8_0",
+    "budget": [512, 1024, 2048],
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "output_dir": "results/longbench_full",
+    "data_dir": "data"
+  }
+}
+

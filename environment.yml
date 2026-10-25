@@ -1,0 +1,14 @@
+name: rocketkv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - cmake
+  - make
+  - pip
+  - pip:
+      - datasets
+      - transformers
+      - tiktoken
+      - numpy
