@@ -8,8 +8,6 @@
   "benchmark": {
     "suite": "longbench",
     "tasks": [
-      "2wikimqa",
-      "qasper",
       "multi_news",
       "trec",
       "passage_retrieval_en",

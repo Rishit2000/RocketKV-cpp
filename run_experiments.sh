@@ -6,7 +6,7 @@
 
 set -e
 
-MODEL_PATH=${1:-"Llama-3.2-3B-Instruct.gguf"}
+MODEL_PATH=${1:-"Llama-3.2-3B-Instruct-Q8_0.gguf"}
 EXTRA_ARGS=${2:-""}
 
 PYTHON=${PYTHON:-python3}
