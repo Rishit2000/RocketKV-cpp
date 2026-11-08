@@ -34,7 +34,7 @@ enum Pipeline { Pack, Summarize, Prepare, Approximate, Softmax, Select, SelectLo
 struct Params {
     uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded, topk_padded;
     uint32_t qd, qh, kd, kt, kh, vd, vt, vh;
-    uint32_t cached_count, mask_type, mask_stride;
+    uint32_t cached_count, mask_type, mask_stride, sort_padded;
 };
 uint32_t power_of_two(uint32_t n) {
     uint32_t p = 1;
@@ -210,6 +210,7 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         p.padded = power_of_two(p.count);
         p.dim_padded = power_of_two(p.dim);
         p.topk_padded = power_of_two(p.topk);
+        p.sort_padded = power_of_two(p.chunks);
         p.qd = stride(q->nb[0]);
         p.qh = stride(q->nb[2]);
         p.kd = stride(k->nb[0]);
@@ -298,10 +299,10 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
             [encoder setBuffer:buffers[RawQ] offset:0 atIndex:18];
         }
         [encoder setBytes:&p length:sizeof(p) atIndex:0];
-        auto dispatch = [&](size_t kernel, uint32_t groups) {
+        auto dispatch = [&](size_t kernel, uint32_t groups, uint32_t threads = 256) {
             [encoder setComputePipelineState:m.pipelines[kernel]];
             [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         };
         auto softmax = [&](uint32_t width, uint32_t exact_mode) {
@@ -319,8 +320,8 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
             dispatch(Approximate, (p.heads * p.chunks + 255) / 256);
             softmax(p.chunks, 0);
         }
-        const size_t sort_bytes = std::max(size_t(16), size_t(p.padded) * sizeof(uint32_t));
-        if (p.topk < p.count && 2 * sort_bytes <= m.device.maxThreadgroupMemoryLength) {
+        const size_t sort_bytes = std::max(size_t(16), size_t(std::max(p.sort_padded, p.topk_padded)) * sizeof(uint32_t));
+        if (p.topk < p.count && 2 * sort_bytes + m.pipelines[SelectLocal].staticThreadgroupMemoryLength <= m.device.maxThreadgroupMemoryLength) {
             [encoder setThreadgroupMemoryLength:sort_bytes atIndex:0];
             [encoder setThreadgroupMemoryLength:sort_bytes atIndex:1];
             dispatch(SelectLocal, p.kv_heads);
@@ -331,7 +332,7 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         }
         dispatch(Exact, (p.heads * p.topk + 255) / 256);
         softmax(p.topk, 1);
-        dispatch(WeightedSum, (p.heads * p.dim + 255) / 256);
+        dispatch(WeightedSum, (p.heads * p.dim + 63) / 64, 64);
         if (!native_encoder) {
             [encoder endEncoding];
             [command commit];
