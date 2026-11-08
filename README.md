@@ -1,6 +1,8 @@
 # RocketKV-cpp: Two-Stage KV Cache Compression in llama.cpp
 
-High-performance C++ implementation of **RocketKV** integrated with [`llama.cpp`](https://github.com/ggerganov/llama.cpp) for low-latency, memory-efficient LLM inference on consumer-edge devices (Apple Silicon Metal GPU).
+C++17 implementation of **RocketKV** prefill eviction and hybrid sparse decode, integrated with a pinned, patched [`llama.cpp`](https://github.com/ggerganov/llama.cpp).
+
+> **Current status:** Stage 1 + Stage 2 is connected to real model inference as a **CPU reference** for supported single-sequence Llama models with F16 KV. There is no Metal HSA kernel or multi-turn support yet. The included small-model tests establish correctness, not a large-model speedup or quality claim.
 
 ---
 
@@ -8,11 +10,17 @@ High-performance C++ implementation of **RocketKV** integrated with [`llama.cpp`
 
 ```
 RocketKV-cpp/
-├── rocket.h / rocket.cpp       # Core RocketKV eviction algorithms (C++17)
-├── runner.cpp                  # C++ batch inference runner linked to llama.cpp/GGML
-├── test_rocket.cpp             # Unit tests for RocketKV kernel operations
-├── Makefile                    # Build scripts for Metal and CPU compilation
-├── eval.py                     # CLI benchmark driver
+├── rocket.h / rocket.cpp       # Budget policy, Stage 1 eviction, Stage 2 CPU algorithm
+├── rocket_adapter.h / rocket_adapter.cpp # GGML node, KV mapping, tensor packing
+├── runner.cpp                  # Mode selection, inference loop, errors, metrics
+├── test_rocket.cpp             # Deterministic algorithm and boundary tests
+├── tests/
+│   └── test_stage2_integration.py # Real-model equivalence and script-entry tests
+├── patches/
+│   ├── llama.cpp-revision     # Pinned upstream commit
+│   └── llama-stage2.patch     # Context hooks and attention graph integration
+├── Makefile                    # Incremental runner and algorithm-test builds
+├── eval.py                     # Legacy Python benchmark driver (Stage 1 only for Rocket)
 ├── eval_suite/                 # Benchmarking orchestration & scoring engine
 │   ├── engine.py               # Metric aggregation & comparison table renderer
 │   ├── runner.py               # Process batch runner client
@@ -20,10 +28,11 @@ RocketKV-cpp/
 │   ├── metrics.py              # Official scoring metrics (F1, ROUGE, EM, etc.)
 │   └── config.py               # Declarative JSON configuration parser
 ├── configs/                    # Experiment configuration files
-│   ├── longbench.json          # Standard LongBench evaluation (6 tasks, 8k context)
+│   ├── longbench.json          # LongBench subset (4 tasks, 30 samples/task, 8k context)
 │   ├── ruler.json              # NVIDIA RULER synthetic benchmark (13 tasks)
 │   └── default.json            # Fast sanity check config
 ├── scripts/
+│   ├── stage2.sh               # Single entry point: build / test / run
 │   ├── download_model.sh       # Script to fetch Llama-3.2 GGUF weights
 │   ├── download_longbench.sh   # Script to download LongBench JSONL datasets
 │   └── prepare_ruler_data.py   # RULER synthetic dataset generator
@@ -32,16 +41,44 @@ RocketKV-cpp/
 
 ---
 
+## What Changed for Stage 2
+
+| Component | Responsibility |
+|---|---|
+| `runner.cpp` | Select `off`, `stage1`, or `hsa`; hand over retained positions; manage request state and report actual forward/layer calls. |
+| `rocket_adapter.cpp/.h` | Read each layer's real KV cache, map positions to live slots, pack tensors, and call the existing sparse attention algorithm from a GGML CPU node. |
+| `patches/llama-stage2.patch` | Add context-scoped hooks and KV-position access; replace decode attention inside the graph; prevent stale graph reuse after mode changes. |
+| `rocket.cpp/.h` | Retain the algorithm structure while adding input checks, short-prompt/zero-query fixes, deterministic top-r ties, and optional selection output for tests. |
+
+```text
+Native prefill -> Stage 1 prompt-KV eviction -> initialize adapter
+  -> each decode forward:
+       each layer: write current K/V -> HSA attention -> original Wo / residual / FFN
+  -> logits and sampling
+```
+
+HSA runs **inside** `llama_decode()`, not as an unused calculation after it returns. The first generated token still comes from prefill logits. Stage 1 retains the existing last-layer, globally shared selection policy; Stage 2 selects independently for each layer and KV group without permanently deleting its unselected candidates.
+
+The adapter files separate integration from algorithm code. The upstream patch is kept small and reproducible instead of committing the ignored `llama.cpp/` checkout.
+
+---
+
 ## Step-by-Step Setup & Quickstart
 
 ### 1. Clone the Repository
 
+The Stage 2 implementation is published on `xiang/dev`:
+
 ```bash
-git clone https://github.com/Rishit2000/RocketKV-cpp.git
+git clone --branch xiang/dev https://github.com/Rishit2000/RocketKV-cpp.git
 cd RocketKV-cpp
 ```
 
-### 2. Set Up the Python Environment
+Build requirements: Git, CMake, `make`, and a C++17 compiler. The test/run entry points also use Python 3; downloading the test model requires `curl`.
+
+### 2. Set Up the Python Evaluation Environment (Optional)
+
+This environment is for dataset preparation and `eval.py`. The C++ build and Stage 2 regression tests do not require these Python packages.
 
 Using Conda:
 
@@ -70,9 +107,9 @@ The revision and patch are stored in `patches/`. Existing checkouts at another r
 
 ---
 
-### 4. Build the RocketKV Runner
+### 4. Incremental Builds and Algorithm Tests
 
-Compile the C++ runner binary using the provided `Makefile`:
+Step 3 already builds the runner. After editing C++ code, rebuild with:
 
 ```bash
 make runner
@@ -87,7 +124,7 @@ make test_rocket
 
 ### Stage 2: build, test, and run
 
-Stage 2 is connected to every decode layer through a GGML custom CPU node. It reads each layer's real KV cache, sorts live slots by absolute position, and feeds the sparse attention result into the original output projection. Prefill and the existing Stage 1 policy are unchanged except for capture/error-handling fixes.
+Use the unified entry point for the complete validation suite or a three-way CPU comparison:
 
 ```bash
 # Algorithm, UBSan, and real-model integration tests.
@@ -101,9 +138,31 @@ bash scripts/stage2.sh run /path/to/llama-model.gguf
 bash scripts/stage2.sh run /path/to/llama-model.gguf samples.json results/my-stage2-run
 ```
 
-`scripts/stage2.sh` is the single Stage 2 entry point; `--help` lists its build/test/run subcommands and environment overrides. Both test and run build automatically. Results include actual per-layer HSA calls, selected/candidate counts, initialization time, and latency per decode forward. The Python evaluation suite keeps its original modes; use the runner or this script for HSA.
+`scripts/stage2.sh` is the single Stage 2 entry point; `--help` lists its build/test/run subcommands and environment overrides. Both test and run build automatically. Results include actual per-layer HSA calls, selected/candidate counts, initialization time, and latency per decode forward. KV size fields are logical estimates, not measured backend allocations. The Python evaluation suite keeps its original modes; use the runner or this script for HSA.
 
-The runner supports `--rocket-mode off|stage1|hsa`. Legacy `--rocket 1` remains Stage-1-only; do not combine the two flags. HSA currently requires a supported Llama model, F16 KV, one sequence, and CPU execution. Unsupported combinations fail explicitly. This is a **functional CPU reference**, not an optimized Metal kernel or a multi-turn implementation; no speedup or task-quality claim is implied by the tiny-model tests.
+| Runner mode | Prefill / eviction | Decode attention |
+|---|---|---|
+| `--rocket-mode off` | Native prefill, no eviction | Native |
+| `--rocket-mode stage1` | Native prefill + Stage 1 eviction | Native |
+| `--rocket-mode hsa` | Native prefill + the same Stage 1 eviction | CPU-reference HSA |
+
+Legacy `--rocket 0/1` still selects off/stage1; do not combine it with `--rocket-mode`. HSA requires F16 **KV**, not necessarily F16 model weights. Unsupported model/backend/type combinations fail explicitly. The comparison script forces all three modes to CPU/F16 KV.
+
+To run **only HSA** on an existing batch, rather than all three comparison modes:
+
+```bash
+./runner --model /path/to/llama-model.gguf --batch samples.json \
+  --rocket-mode hsa --kv-type f16 --gpu-layers 0 --budget 1024 \
+  --n-ctx 9216 --context-len 8192 --output hsa-results.json
+```
+
+The batch input is a JSON array, for example:
+
+```json
+[{"sample_id": 1, "prompt": "Once upon a time", "max_tokens": 32}]
+```
+
+The built-in demonstration is a smoke test, not a LongBench/RULER accuracy evaluation. `test` covers algorithm boundaries, all-candidate attention/logit equivalence, sparse graph connectivity, state isolation, legacy modes, failure cases, and script dispatch. The reference currently packs candidate K/V on CPU and recomputes chunk information each step; persistent summaries and backend optimization remain future work.
 
 The test script uses UBSan by default. To also run ASan, set `SANITIZERS=address,undefined` and select a compatible compiler with `CXX`. On the development machine, Apple's ASan runtime deadlocked before `main()`; that run was stopped and is not reported as passing. Sanitizer runs have a timeout rather than hanging indefinitely.
 
@@ -147,6 +206,8 @@ python3 scripts/prepare_ruler_data.py --context-len 8192 --num-samples 500
 
 ### 7. Run Evaluation Benchmarks
 
+> **Important:** these `eval.py` commands use the original Python pipeline. Its `rocket-kv` mode is **Stage 1 only**, and `attn_type: "all"` does not include HSA. Formal Stage 1 + Stage 2 evaluation still needs a minimal HSA mode connection to this pipeline, or explicit batch export, HSA execution, and result scoring.
+
 #### LongBench Evaluation
 To evaluate across LongBench tasks comparing `full-kv`, `quantized-kv (q8_0)`, and `rocket-kv` (budgets 512, 1024, 2048):
 
@@ -165,7 +226,7 @@ python3 eval.py configs/ruler.json
 
 ## Benchmark Configuration
 
-All benchmark parameters are defined in declarative JSON files under `configs/`:
+Legacy Python benchmark parameters are defined in declarative JSON files under `configs/`. These are not automatically consumed by `scripts/stage2.sh`:
 
 ```json
 {
@@ -194,6 +255,8 @@ All benchmark parameters are defined in declarative JSON files under `configs/`:
   }
 }
 ```
+
+Dataset-specific generation limits can override `model.max_tokens`. For example, LongBench `multi_news` uses a limit of 512 in `eval_suite/config/dataset2maxlen.json`; do not estimate all task runtimes using the example's value of 32.
 
 ---
 
