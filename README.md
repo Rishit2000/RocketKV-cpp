@@ -215,7 +215,19 @@ python3 scripts/prepare_ruler_data.py --context-len 8192 --num-samples 500
 
 ### 7. Run Evaluation Benchmarks
 
-> **Important:** these `eval.py` commands use the original Python pipeline. Its `rocket-kv` mode is **Stage 1 only**, and `attn_type: "all"` does not include HSA. Formal Stage 1 + Stage 2 evaluation still needs a minimal HSA mode connection to this pipeline, or explicit batch export, HSA execution, and result scoring.
+> **Important:** these `eval.py` commands use the original Python pipeline. Its `rocket-kv` mode is **Stage 1 only**, and `attn_type: "all"` does not include HSA. Use `scripts/run_longbench_stage2.py` below for the scored three-mode Metal comparison.
+
+#### Scored LongBench comparison with Metal HSA
+
+```bash
+python3 -m pip install rouge==1.0.1 fuzzywuzzy==0.18.0 python-Levenshtein==0.27.1
+python3 scripts/run_longbench_stage2.py --config configs/longbench.json \
+  --budget 1024 --threads 16 --output results/longbench_stage2
+```
+
+This entry point runs **off / stage1 / hsa** with F16 KV and Metal model offload, using Metal HSA in the third mode. It reads the task list, sample count, model, context limit and eviction settings from the config; `--budget` selects one budget, rather than the legacy config's attention-mode/budget sweep. The default small set is the first 30 samples of each of four tasks (120 samples, 360 evaluations). Task-specific generation limits are retained.
+
+Every sample has a scored JSON checkpoint and a runner log. `status.json` tracks progress, `summary.json` contains per-task scores and timing, and `manifest.json` records the binary, inputs and settings. Re-running the same command resumes completed checkpoints; changed settings require a new output directory. Each sample loads the model separately for durable checkpoints, so wall time includes startup overhead. Inference time is reported separately. Scores reuse this repository's prompt templates, prediction cleanup and metrics; they are not a claim of official leaderboard equivalence.
 
 #### LongBench Evaluation
 To evaluate across LongBench tasks comparing `full-kv`, `quantized-kv (q8_0)`, and `rocket-kv` (budgets 512, 1024, 2048):
