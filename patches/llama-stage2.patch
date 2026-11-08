@@ -1,0 +1,240 @@
+diff --git a/include/llama-rocket.h b/include/llama-rocket.h
+new file mode 100644
+index 0000000..fedfab8
+--- /dev/null
++++ b/include/llama-rocket.h
+@@ -0,0 +1,45 @@
++#ifndef LLAMA_ROCKET_H
++#define LLAMA_ROCKET_H
++
++#include "llama.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define LLAMA_ROCKET_ABI_VERSION 1
++
++// Q: [D, 1, Hq, 1], K/V: [D, slots, Hkv, 1]. Return F32 [D, Hq, 1, 1].
++typedef struct ggml_tensor * (*llama_rocket_attention_builder)(
++        struct ggml_context * graph_ctx,
++        struct ggml_tensor * q,
++        struct ggml_tensor * k,
++        struct ggml_tensor * v,
++        struct ggml_tensor * mask,
++        float scale,
++        int32_t layer,
++        void * user_data);
++
++LLAMA_API int32_t llama_rocket_abi_version(void);
++
++// Diagnostic native matmul/softmax path with F32 operands and accumulation.
++LLAMA_API void llama_rocket_set_f32_reference(struct llama_context * ctx, bool enabled);
++
++// NULL restores native attention. The caller owns user_data until all work completes.
++LLAMA_API bool llama_set_rocket_attention(
++        struct llama_context * ctx,
++        llama_rocket_attention_builder builder,
++        void * user_data);
++
++// Sequence 0 only. NULL returns slot capacity; otherwise copy the requested prefix.
++// No synchronization: use after synchronize(), or inside the single-sequence CPU node.
++LLAMA_API int32_t llama_rocket_kv_positions(
++        const struct llama_context * ctx,
++        llama_pos * positions,
++        size_t capacity);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 33ad784..303d545 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -7,6 +7,7 @@
+ #include "llama-batch.h"
+ #include "llama-io.h"
+ #include "llama-memory.h"
++#include "llama-kv-cache.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -1393,6 +1394,36 @@ bool llama_context::get_causal_attn() const {
+     return cparams.causal_attn;
+ }
+ 
++bool llama_context::set_rocket_attention(llama_rocket_attention_builder builder, void * user_data) {
++    synchronize();
++    if (builder) {
++        const auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
++        const auto & hp = model.hparams;
++        if (model.arch != LLM_ARCH_LLAMA || !kv || cparams.n_seq_max != 1 ||
++                !cparams.causal_attn || cparams.training || cparams.pipeline_parallel ||
++                hp.swa_type != LLAMA_SWA_TYPE_NONE || hp.attn_soft_cap || hp.f_max_alibi_bias != 0.0f ||
++                kv->type_k() != GGML_TYPE_F16 || kv->type_v() != GGML_TYPE_F16 || kv->get_n_stream() != 1) {
++            LLAMA_LOG_ERROR("%s: requires single-sequence Llama causal attention with F16 KV\n", __func__);
++            return false;
++        }
++        for (uint32_t il = 0; il < hp.n_layer(); ++il) {
++            if (hp.n_head_kv(il) == 0 || hp.n_head(il) % hp.n_head_kv(il) != 0 ||
++                    hp.n_embd_head_k(il) != hp.n_embd_head_v(il)) {
++                LLAMA_LOG_ERROR("%s: unsupported head dimensions\n", __func__);
++                return false;
++            }
++        }
++    }
++    cparams.rocket_attention = builder;
++    cparams.rocket_user_data = user_data;
++    return true;
++}
++
++void llama_context::set_rocket_f32_reference(bool enabled) {
++    synchronize();
++    cparams.rocket_f32_reference = enabled;
++}
++
+ void llama_context::set_warmup(bool value) {
+     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+ 
+@@ -1841,6 +1872,10 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    if (cparams.rocket_attention && batch_inp.tokens.size() != 1) {
++        LLAMA_LOG_ERROR("%s: Rocket decode requires exactly one token\n", __func__);
++        return -1;
++    }
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -4226,6 +4261,39 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+     ctx->set_causal_attn(causal_attn);
+ }
+ 
++int32_t llama_rocket_abi_version(void) {
++    return LLAMA_ROCKET_ABI_VERSION;
++}
++
++void llama_rocket_set_f32_reference(llama_context * ctx, bool enabled) {
++    ctx->set_rocket_f32_reference(enabled);
++}
++
++bool llama_set_rocket_attention(llama_context * ctx, llama_rocket_attention_builder builder, void * user_data) {
++    return ctx && ctx->set_rocket_attention(builder, user_data);
++}
++
++int32_t llama_rocket_kv_positions(const llama_context * ctx, llama_pos * positions, size_t capacity) {
++    if (!ctx || ctx->n_seq_max() != 1) {
++        return -1;
++    }
++    const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
++    if (!kv || kv->get_n_stream() != 1) {
++        return -1;
++    }
++    const auto & cells = kv->get_cells(0);
++    if (!positions) {
++        return cells.size();
++    }
++    if (capacity > cells.size()) {
++        return -1;
++    }
++    for (size_t i = 0; i < capacity; ++i) {
++        positions[i] = cells.is_empty(i) || !cells.seq_has(i, 0) ? -1 : cells.pos_get(i);
++    }
++    return capacity;
++}
++
+ bool llama_get_causal_attn(const llama_context * ctx) {
+     return ctx->get_causal_attn();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..84e6341 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -122,6 +122,8 @@ struct llama_context {
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
++    bool set_rocket_attention(llama_rocket_attention_builder builder, void * user_data);
++    void set_rocket_f32_reference(bool enabled);
+     void set_warmup(bool value);
+ 
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 0c260f7..646db3d 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "llama.h"
++#include "llama-rocket.h"
+ 
+ #include <cstdint>
+ #include <vector>
+@@ -68,5 +69,9 @@ struct llama_cparams {
+     ggml_backend_sched_eval_callback cb_eval;
+     void * cb_eval_user_data;
+ 
++    llama_rocket_attention_builder rocket_attention = nullptr;
++    void * rocket_user_data = nullptr;
++    bool rocket_f32_reference = false;
++
+     llama_context * ctx_other;
+ };
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index cffd083..0f1796d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2991,7 +2991,20 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+     ggml_tensor * cur;
+ 
+-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
++    if (cparams.rocket_attention && q->ne[1] == 1 && n_stream == 1) {
++        GGML_ASSERT(!kq_b && !sinks && !v_mla);
++        if (v_trans) {
++            v = ggml_transpose(ctx0, v);
++        }
++        cur = cparams.rocket_attention(ctx0, q, k, v, kq_mask, kq_scale, il, cparams.rocket_user_data);
++        GGML_ASSERT(cur && cur->type == GGML_TYPE_F32);
++        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
++        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], 1);
++        ggml_build_forward_expand(gf, cur);
++        return cur;
++    }
++
++    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !cparams.rocket_f32_reference;
+     if (use_flash_attn) {
+         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+ 
+@@ -3036,6 +3049,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+     } else {
++        if (cparams.rocket_f32_reference) {
++            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
++            v = ggml_cast(ctx0, v, GGML_TYPE_F32);
++            if (kq_mask) {
++                kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
++            }
++        }
+         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
+         cb(kq, "kq", il);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c1a7d36..68ef82e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -902,6 +902,9 @@ struct llm_graph_params {
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+             cparams.causal_attn             == other.cparams.causal_attn             &&
++            cparams.rocket_attention        == other.cparams.rocket_attention        &&
++            cparams.rocket_user_data        == other.cparams.rocket_user_data        &&
++            cparams.rocket_f32_reference    == other.cparams.rocket_f32_reference    &&
+             arch  == other.arch  &&
+             gtype == other.gtype &&
+             cvec  == other.cvec  &&

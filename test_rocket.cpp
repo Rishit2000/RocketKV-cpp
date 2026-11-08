@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cassert>
 #include <algorithm>
+#include <functional>
+#include <limits>
+#include <stdexcept>
 
 static float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
     assert(a.size() == b.size());
@@ -51,6 +54,99 @@ static std::vector<float> compute_exact_dense_decode(
         }
     }
     return out;
+}
+
+static void assert_close(const std::vector<float>& actual, const std::vector<float>& expected) {
+    assert(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        assert(std::isfinite(actual[i]));
+        assert(std::abs(actual[i] - expected[i]) <= 1e-5f + 1e-4f * std::abs(expected[i]));
+    }
+}
+
+static void assert_invalid(const std::function<void()>& action) {
+    bool rejected = false;
+    try {
+        action();
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
+static void test_sparse_contract() {
+    RocketConfig cfg{};
+    cfg.num_heads = 4;
+    cfg.num_heads_kv = 2;
+    cfg.dim_head = 2;
+    cfg.chunk_size = 2;
+    cfg.r_dim = 1;
+    cfg.compression_ratio = 2.0f;
+    cfg.topk_decode = 2;
+    std::vector<float> q = {1, 0, 2, 0, -1, 0, -2, 0};
+    std::vector<float> k = {0, 0, 1, 0, 3, 0, 4, 0, 10, 0,
+                           0, 0, 1, 0, 3, 0, 4, 0, -10, 0};
+    std::vector<float> v(20);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = (float)i / 7.0f;
+    std::vector<std::vector<int>> selected;
+    auto output = compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg, &selected);
+    assert((selected == std::vector<std::vector<int>>{{2, 4}, {0, 4}}));
+
+    std::vector<float> oracle;
+    for (int h = 0; h < 4; ++h) {
+        const int group = h / 2;
+        std::vector<float> selected_k, selected_v;
+        for (int token : selected[group]) {
+            for (int d = 0; d < 2; ++d) {
+                selected_k.push_back(k[(group * 5 + token) * 2 + d]);
+                selected_v.push_back(v[(group * 5 + token) * 2 + d]);
+            }
+        }
+        auto head = compute_exact_dense_decode(q.data() + h * 2, selected_k.data(), selected_v.data(), 2, 2);
+        oracle.insert(oracle.end(), head.begin(), head.end());
+    }
+    assert_close(output, oracle);
+
+    cfg.topk_decode = 99;
+    cfg.r_dim = 2;
+    output = compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg);
+    oracle.clear();
+    for (int h = 0; h < 4; ++h) {
+        auto head = compute_exact_dense_decode(q.data() + h * 2, k.data() + (h / 2) * 10,
+                                              v.data() + (h / 2) * 10, 5, 2);
+        oracle.insert(oracle.end(), head.begin(), head.end());
+    }
+    assert_close(output, oracle);
+
+    cfg.topk_decode = 2;
+    cfg.r_dim = 1;
+    std::fill(q.begin(), q.end(), 0.0f);
+    output = compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg, &selected);
+    assert((selected == std::vector<std::vector<int>>{{0, 1}, {0, 1}}));
+    for (int h = 0; h < 4; ++h) {
+        for (int d = 0; d < 2; ++d) {
+            const int base = (h / 2) * 10;
+            assert(std::abs(output[h * 2 + d] - (v[base + d] + v[base + 2 + d]) / 2) < 1e-6f);
+        }
+    }
+    // A nonzero head can also have zero mass in the group's selected dimension.
+    q = {10, 0, 0, 1, -10, 0, 0, 1};
+    output = compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg);
+    for (float value : output) assert(std::isfinite(value));
+
+    assert_invalid([&] { compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 0, cfg); });
+    cfg.topk_decode = 0;
+    assert_invalid([&] { compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg); });
+    cfg.topk_decode = 2;
+    cfg.num_heads = 3;
+    assert_invalid([&] { compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg); });
+    cfg.num_heads = 4;
+    q[0] = std::numeric_limits<float>::quiet_NaN();
+    assert_invalid([&] { compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), 5, cfg); });
+    assert_invalid([] { compute_rocket_params(0, 100, 8, 64); });
+    const auto short_prompt = compute_rocket_params(8, 1, 16, 64, 32);
+    assert(short_prompt.prompt_budget == 1 && short_prompt.k == 1);
+    std::cout << "  GQA selection, tail chunk, dense equivalence, zero queries, and invalid inputs: PASS\n";
 }
 
 int main() {
@@ -208,6 +304,9 @@ int main() {
     assert(p16k.chunk_size == 3);
     assert(p16k.r == 81);
     std::cout << "  16K Sequence Budget Derivation: PASS" << std::endl;
+
+    std::cout << "\n[Test 4] Deterministic Sparse Attention Contract..." << std::endl;
+    test_sparse_contract();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "All Algorithmic Verification Tests Passed!" << std::endl;

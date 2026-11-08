@@ -60,18 +60,13 @@ pip install datasets transformers tiktoken numpy
 
 ### 3. Clone and Build `llama.cpp`
 
-RocketKV dynamically links against `llama.cpp` shared libraries. Clone and compile upstream `llama.cpp` with Metal support enabled:
+RocketKV links against a pinned, patched `llama.cpp`. The build script checks the revision, applies the graph integration patch, and builds the libraries and runner:
 
 ```bash
-# Clone upstream llama.cpp
-git clone https://github.com/ggerganov/llama.cpp.git
-
-# Build shared libraries with Metal acceleration
-cd llama.cpp
-cmake -B build -DGGML_METAL=ON -DBUILD_SHARED_LIBS=ON
-cmake --build build --config Release -j
-cd ..
+bash scripts/stage2.sh build
 ```
+
+The revision and patch are stored in `patches/`. Existing checkouts at another revision or with conflicting edits are rejected, not reset. `JOBS=4` is the default build parallelism; Metal is enabled on macOS, but Stage 2 currently executes on CPU.
 
 ---
 
@@ -89,6 +84,30 @@ To run unit tests verifying the RocketKV eviction kernel:
 make test_rocket
 ./test_rocket
 ```
+
+### Stage 2: build, test, and run
+
+Stage 2 is connected to every decode layer through a GGML custom CPU node. It reads each layer's real KV cache, sorts live slots by absolute position, and feeds the sparse attention result into the original output projection. Prefill and the existing Stage 1 policy are unchanged except for capture/error-handling fixes.
+
+```bash
+# Algorithm, UBSan, and real-model integration tests.
+# Downloads a pinned, SHA-256-verified 1.1 MB Llama test model if needed.
+bash scripts/stage2.sh test
+
+# Three-way CPU comparison: full KV, Stage 1, and Stage 1 + HSA.
+bash scripts/stage2.sh run /path/to/llama-model.gguf
+
+# Use your own existing batch JSON and output directory.
+bash scripts/stage2.sh run /path/to/llama-model.gguf samples.json results/my-stage2-run
+```
+
+`scripts/stage2.sh` is the single Stage 2 entry point; `--help` lists its build/test/run subcommands and environment overrides. Both test and run build automatically. Results include actual per-layer HSA calls, selected/candidate counts, initialization time, and latency per decode forward. The Python evaluation suite keeps its original modes; use the runner or this script for HSA.
+
+The runner supports `--rocket-mode off|stage1|hsa`. Legacy `--rocket 1` remains Stage-1-only; do not combine the two flags. HSA currently requires a supported Llama model, F16 KV, one sequence, and CPU execution. Unsupported combinations fail explicitly. This is a **functional CPU reference**, not an optimized Metal kernel or a multi-turn implementation; no speedup or task-quality claim is implied by the tiny-model tests.
+
+The test script uses UBSan by default. To also run ASan, set `SANITIZERS=address,undefined` and select a compatible compiler with `CXX`. On the development machine, Apple's ASan runtime deadlocked before `main()`; that run was stopped and is not reported as passing. Sanitizer runs have a timeout rather than hanging indefinitely.
+
+For diagnostics, `--hsa-full` selects all current candidates and `--trace-logits` records per-layer attention outputs and logits. Tests use fixed `forced_tokens` in batch JSON. The native comparator uses `--reference-f32` only during decode: ordinary CPU F16 FlashAttention rounds query/accumulator values, whereas the Rocket reference accumulates in F32. Native F32 matmul/softmax is the numerical oracle; default inference still uses the original native attention path.
 
 ---
 

@@ -2,6 +2,9 @@
 #include <cmath>
 #include <algorithm>
 #include <cfloat>
+#include <climits>
+#include <stdexcept>
+#include <string>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -11,6 +14,30 @@ struct TokenScore {
     int memory_idx;
 };
 
+static void validate_heads(const RocketConfig& cfg) {
+    if (cfg.num_heads <= 0 || cfg.num_heads_kv <= 0 || cfg.dim_head <= 0 ||
+        cfg.num_heads % cfg.num_heads_kv != 0) {
+        throw std::invalid_argument("RocketKV requires positive dimensions and Hq divisible by Hkv");
+    }
+}
+
+static int checked_elements(int heads, int tokens, int dim) {
+    if (heads <= 0 || tokens <= 0 || dim <= 0 ||
+        heads > INT_MAX / tokens || heads * tokens > INT_MAX / dim) {
+        throw std::invalid_argument("RocketKV tensor dimensions are invalid or too large");
+    }
+    return heads * tokens * dim;
+}
+
+static void validate_values(const float* data, int count, const char* name) {
+    if (!data) throw std::invalid_argument(std::string("Missing RocketKV tensor: ") + name);
+    for (int i = 0; i < count; ++i) {
+        if (!std::isfinite(data[i])) {
+            throw std::invalid_argument(std::string("Non-finite RocketKV tensor: ") + name);
+        }
+    }
+}
+
 RocketBudgetParams compute_rocket_params(
     int token_budget, 
     int sequence_length, 
@@ -18,6 +45,10 @@ RocketBudgetParams compute_rocket_params(
     int head_dim, 
     int window_size) 
 {
+    if (token_budget <= 0 || sequence_length <= 0 || max_new_tokens < 0 ||
+        head_dim <= 0 || window_size <= 0) {
+        throw std::invalid_argument("Invalid RocketKV budget parameters");
+    }
     RocketBudgetParams p;
     p.sequence_length = sequence_length;
     p.max_new_tokens = max_new_tokens;
@@ -31,12 +62,12 @@ RocketBudgetParams compute_rocket_params(
     
     // Total capacity budget allowed across prompt + generation
     int capacity_budget = (int)std::floor((float)sequence_length / std::pow(cr_initial, alpha));
-    capacity_budget = std::max(capacity_budget, std::min(2 * max_new_tokens, sequence_length));
+    capacity_budget = std::max(capacity_budget, (int)std::min(2LL * max_new_tokens, (long long)sequence_length));
     p.capacity_budget = capacity_budget;
     
     // Prompt budget for Stage 1 prefill eviction
     int prompt_budget = std::min(sequence_length - max_new_tokens, capacity_budget - max_new_tokens);
-    prompt_budget = std::max(window_size, prompt_budget);
+    prompt_budget = std::clamp(prompt_budget, std::min(window_size, sequence_length), sequence_length);
     p.prompt_budget = prompt_budget;
     
     // Stage 2 decode top-k budget
@@ -63,6 +94,11 @@ std::vector<int> compute_prefill_eviction(
     int len_q, int len_k, 
     const RocketConfig& cfg) 
 {
+    validate_heads(cfg);
+    if (len_q <= 0 || len_k <= 0 || cfg.window_size <= 0 || cfg.kernel_size <= 0 ||
+        cfg.prompt_budget < std::min(cfg.window_size, std::min(len_q, len_k))) {
+        throw std::invalid_argument("Invalid RocketKV prefill parameters");
+    }
     // If prompt is within budget, keep all tokens immediately
     if (len_k <= cfg.prompt_budget) {
         std::vector<int> kept_indices(len_k);
@@ -70,7 +106,9 @@ std::vector<int> compute_prefill_eviction(
         return kept_indices;
     }
 
-    int obs_w = std::min(cfg.window_size, len_q);
+    validate_values(Q, checked_elements(cfg.num_heads, len_q, cfg.dim_head), "Q");
+    validate_values(K, checked_elements(cfg.num_heads_kv, len_k, cfg.dim_head), "K");
+    int obs_w = std::min(cfg.window_size, std::min(len_q, len_k));
     int non_obs_k = len_k - obs_w;
     int heads_per_kv = cfg.num_heads / cfg.num_heads_kv;
     float inv_sqrt_d = 1.0f / std::sqrt((float)cfg.dim_head);
@@ -170,20 +208,31 @@ std::vector<int> compute_prefill_eviction(
 
 std::vector<float> compute_hybrid_sparse_decode(
     const float* Q, const float* K, const float* V,
-    int len_k, const RocketConfig& cfg) 
+    int len_k, const RocketConfig& cfg,
+    std::vector<std::vector<int>>* selected_tokens)
 {
-    int heads_per_kv = std::max(1, cfg.num_heads / cfg.num_heads_kv);
+    validate_heads(cfg);
+    if (len_k <= 0 || cfg.topk_decode <= 0 || cfg.chunk_size < 0 || cfg.r_dim < 0 ||
+        !std::isfinite(cfg.compression_ratio) || cfg.compression_ratio < 1.0f ||
+        cfg.compression_ratio >= (float)INT_MAX) {
+        throw std::invalid_argument("Invalid RocketKV sparse decode parameters");
+    }
+    validate_values(Q, checked_elements(cfg.num_heads, 1, cfg.dim_head), "Q");
+    const int kv_elements = checked_elements(cfg.num_heads_kv, len_k, cfg.dim_head);
+    validate_values(K, kv_elements, "K");
+    validate_values(V, kv_elements, "V");
+    int heads_per_kv = cfg.num_heads / cfg.num_heads_kv;
     
     int chunk_size = (cfg.chunk_size > 0) ? cfg.chunk_size : 
         std::max(1, std::min((int)std::floor(cfg.compression_ratio), (int)std::ceil(std::sqrt(cfg.compression_ratio))));
     
-    int num_chunks = (len_k + chunk_size - 1) / chunk_size;
+    int num_chunks = 1 + (len_k - 1) / chunk_size;
     int r = (cfg.r_dim > 0) ? cfg.r_dim : 
         std::min(cfg.dim_head, std::max(1, (int)std::round((float)cfg.dim_head * (float)chunk_size / cfg.compression_ratio)));
     r = std::min(r, cfg.dim_head);
     int final_k = std::min(cfg.topk_decode, len_k);
     std::vector<float> final_output(cfg.num_heads * cfg.dim_head, 0.0f);
-    if (len_k <= 0 || final_k <= 0) return final_output;
+    if (selected_tokens) selected_tokens->assign(cfg.num_heads_kv, {});
 
     float inv_sqrt_d = 1.0f / std::sqrt((float)cfg.dim_head);
 
@@ -231,7 +280,10 @@ std::vector<float> compute_hybrid_sparse_decode(
         } else {
             std::nth_element(
                 abs_q_group.begin(), abs_q_group.begin() + r, abs_q_group.end(),
-                [](const TokenScore& a, const TokenScore& b) { return a.score > b.score; }
+                [](const TokenScore& a, const TokenScore& b) {
+                    if (a.score != b.score) return a.score > b.score;
+                    return a.memory_idx < b.memory_idx;
+                }
             );
 
             for (int ri = 0; ri < r; ri++) {
@@ -254,7 +306,7 @@ std::vector<float> compute_hybrid_sparse_decode(
 
         for (int c = 0; c < num_chunks; ++c) {
             int start_tok = c * chunk_size;
-            int end_tok = std::min(start_tok + chunk_size, len_k);
+            int end_tok = start_tok + std::min(chunk_size, len_k - start_tok);
 
             // Compute representative chunk key P = K_max if sign[d] >= 0 else K_min
             std::vector<float> P_chunk(r);
@@ -284,7 +336,7 @@ std::vector<float> compute_hybrid_sparse_decode(
                     int d = top_r_dims[ri];
                     head_approx += q_h[d] * P_chunk[ri];
                 }
-                chunk_logits[h * num_chunks + c] = head_approx / custom_scale[h];
+                chunk_logits[h * num_chunks + c] = custom_scale[h] > 0.0f ? head_approx / custom_scale[h] : 0.0f;
             }
         }
 
@@ -312,7 +364,7 @@ std::vector<float> compute_hybrid_sparse_decode(
         std::vector<TokenScore> group_token_scores(len_k);
         for (int c = 0; c < num_chunks; ++c) {
             int start_tok = c * chunk_size;
-            int end_tok = std::min(start_tok + chunk_size, len_k);
+            int end_tok = start_tok + std::min(chunk_size, len_k - start_tok);
             float group_prob = 0.0f;
             for (int h = 0; h < heads_per_kv; ++h) {
                 group_prob += chunk_probs[h * num_chunks + c];
@@ -338,6 +390,7 @@ std::vector<float> compute_hybrid_sparse_decode(
             kept_token_indices[i] = group_token_scores[i].memory_idx;
         }
         std::sort(kept_token_indices.begin(), kept_token_indices.end());
+        if (selected_tokens) (*selected_tokens)[h_kv] = kept_token_indices;
 
         // Exact Sparse Attention on the Selected K Tokens for Each Head
         std::vector<float> exact_scores(final_k);
@@ -378,5 +431,6 @@ std::vector<float> compute_hybrid_sparse_decode(
         }
     }
 
+    validate_values(final_output.data(), (int)final_output.size(), "attention output");
     return final_output;
 }

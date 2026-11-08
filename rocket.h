@@ -47,4 +47,5 @@ std::vector<int> compute_prefill_eviction(
 
 std::vector<float> compute_hybrid_sparse_decode(
     const float* Q, const float* K, const float* V,
-    int len_k, const RocketConfig& cfg);
+    int len_k, const RocketConfig& cfg,
+    std::vector<std::vector<int>>* selected_tokens = nullptr);
