@@ -5,6 +5,7 @@
 #include "rocket_metal.h"
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -34,13 +35,18 @@ private:
     struct Layer {
         RocketAdapter* owner;
         int index;
+        // Original KV views in the active graph, before scheduler input copies.
+        const ggml_tensor* k = nullptr;
+        const ggml_tensor* v = nullptr;
     };
 
     static ggml_tensor* build_attention(
         ggml_context* graph_ctx, ggml_tensor* q, ggml_tensor* k, ggml_tensor* v,
         ggml_tensor* mask, float scale, int32_t layer, void* user_data);
     static void compute(ggml_tensor* dst, int ith, int nth, void* user_data);
-    void compute_layer(ggml_tensor* dst, int layer);
+    static void encode(ggml_tensor* dst, void* encoder, void* user_data);
+    void execute(ggml_tensor* dst, int layer, void* encoder);
+    void compute_layer(ggml_tensor* dst, int layer, void* encoder);
     void refresh_slots();
 
     llama_context* ctx_;
@@ -53,6 +59,7 @@ private:
     std::vector<int> slots_;
     std::vector<float> q_, k_, v_;
     std::string error_;
+    std::mutex encode_mutex_;
     int next_layer_ = 0;
     bool active_ = false;
     bool step_pending_ = false;

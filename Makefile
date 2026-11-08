@@ -27,7 +27,7 @@ build:
 build/rocket_metal_source.h: src/metal/rocket_metal.metal | build
 	python3 -c 'from pathlib import Path; Path("$@").write_text("static const char* rocket_metal_source = R\"MSL(" + Path("$<").read_text() + ")MSL\";\n")'
 
-build/rocket_metal.o: src/metal/rocket_metal.mm $(HEADERS) build/rocket_metal_source.h
+build/rocket_metal.o: src/metal/rocket_metal.mm $(HEADERS) build/rocket_metal_source.h $(LLAMA_DIR)/ggml/include/ggml-metal.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fobjc-arc -c $< -o $@
 
 build/rocket_metal_stub.o: src/metal/rocket_metal_stub.cpp $(HEADERS) | build

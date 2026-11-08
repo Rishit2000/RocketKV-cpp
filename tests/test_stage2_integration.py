@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,7 +71,7 @@ class Stage2IntegrationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.counter = 0
 
-    def run_batch(self, samples, mode="hsa", extra=(), error=None):
+    def run_batch(self, samples, mode="hsa", extra=(), error=None, trace=True):
         self.counter += 1
         path = Path(self.temp.name)
         source = path / f"input-{self.counter}.json"
@@ -81,8 +82,10 @@ class Stage2IntegrationTests(unittest.TestCase):
             "--output", str(target), "--n-ctx", "512", "--gpu-layers", "0",
             "--context-len", "256",
             "--threads", "2", "--budget", "16", "--window-size", "4",
-            "--kernel-size", "3", "--trace-logits",
+            "--kernel-size", "3",
         ]
+        if trace:
+            command.append("--trace-logits")
         if mode is not None:
             command.extend(["--rocket-mode", mode])
         result = subprocess.run(command + list(extra), text=True, capture_output=True, timeout=120)
@@ -117,14 +120,17 @@ class Stage2IntegrationTests(unittest.TestCase):
                 self.assertLessEqual(abs(a - b), tolerance + tolerance * abs(b))
         return maximum
 
-    def assert_hsa_calls(self, result, steps, backend="cpu-reference"):
+    def assert_hsa_calls(self, result, steps, backend="cpu-reference", trace=True):
         metrics = result["metrics"]
         self.assertEqual(metrics["effective_mode"], "hsa")
         self.assertEqual(metrics["stage2_backend"], backend)
         self.assertEqual(metrics["decode_forward_calls"], steps)
         self.assertEqual(metrics["stage2_layer_calls"], metrics["model_layers"] * steps)
         self.assertEqual(metrics["stage2_calls_per_layer"], [steps] * metrics["model_layers"])
-        self.assertEqual(len(result["attention"]), steps)
+        if trace:
+            self.assertEqual(len(result["attention"]), steps)
+        else:
+            self.assertNotIn("attention", result)
 
     def test_full_selection_matches_dense_layers_and_logits(self):
         sample = self.sample()
@@ -284,6 +290,31 @@ class Stage2IntegrationTests(unittest.TestCase):
             self.assertEqual(result["metrics"]["model_backend"], "metal")
             self.assertEqual(result["kept_positions"], alone["kept_positions"])
             self.assert_close(result["logits"], alone["logits"], 2e-4)
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on macOS")
+    def test_metal_private_kv_copy_fallback(self):
+        sample = self.sample()
+        options = ["--stage2-backend", "metal", "--gpu-layers", "99"]
+        shared = self.run_batch([sample], extra=options)[0]
+        with mock.patch.dict(os.environ, {"GGML_METAL_SHARED_BUFFERS_DISABLE": "1"}):
+            private = self.run_batch([sample], extra=options)[0]
+        self.assert_hsa_calls(private, len(FORCED) - 1, "metal")
+        self.assertEqual(shared["kept_positions"], private["kept_positions"])
+        self.assert_close(shared["attention"], private["attention"])
+        self.assert_close(shared["logits"], private["logits"])
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on macOS")
+    def test_metal_without_trace_and_partial_offload(self):
+        sample = dict(sample_id=1, prompt=PROMPT, max_tokens=16)
+        for layers in (1, 99):
+            with self.subTest(layers=layers):
+                options = ["--stage2-backend", "metal", "--gpu-layers", str(layers)]
+                traced = self.run_batch([sample], extra=options)[0]
+                plain = self.run_batch([sample], extra=options, trace=False)[0]
+                self.assertEqual(plain["generated"], traced["generated"])
+                steps = traced["metrics"]["decode_forward_calls"]
+                self.assertGreater(steps, 0)
+                self.assert_hsa_calls(plain, steps, "metal", trace=False)
 
 
 if __name__ == "__main__":
