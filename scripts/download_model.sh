@@ -5,6 +5,10 @@
 
 set -e
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "$ROOT/models"
+cd "$ROOT/models"
+
 MODEL_NAME="Llama-3.2-3B-Instruct-Q8_0.gguf"
 REPO_ID="bartowski/Llama-3.2-3B-Instruct-GGUF"
 

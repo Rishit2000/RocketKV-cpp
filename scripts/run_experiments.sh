@@ -6,7 +6,10 @@
 
 set -e
 
-MODEL_PATH=${1:-"Llama-3.2-3B-Instruct-Q8_0.gguf"}
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+MODEL_PATH=${1:-"models/Llama-3.2-3B-Instruct-Q8_0.gguf"}
 EXTRA_ARGS=${2:-""}
 
 PYTHON=${PYTHON:-python3}

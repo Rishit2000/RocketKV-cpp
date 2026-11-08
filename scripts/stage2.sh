@@ -9,16 +9,17 @@ Usage: scripts/stage2.sh <command> [arguments]
   build                         Build the pinned, patched llama.cpp and runner.
   test [MODEL.gguf]              Run algorithm, model, and UBSan tests.
   run MODEL.gguf [BATCH.json] [OUTPUT_DIR]
-                                Compare off / stage1 / hsa on CPU with F16 KV.
+                                Compare off / stage1 / hsa with F16 KV (CPU by default).
 
 test downloads a verified 1.1 MB model when no model is supplied.
 run creates a demonstration batch when BATCH.json is omitted.
-Results default to results/stage2/. This is not a Metal speed benchmark.
+Results default to results/stage2/. GPU_LAYERS=99 uses Metal model offload;
+Set STAGE2_BACKEND=metal to also execute HSA attention on GPU.
 
 Build: JOBS=4 CXX=c++ METAL=ON|OFF (default: ON on macOS)
 Test:  SANITIZERS=undefined (ASan requires a compatible runtime)
 Run:   BUDGET=128 N_CTX=2048 CONTEXT_LEN=1024 MAX_TOKENS=32
-       WINDOW_SIZE=32 KERNEL_SIZE=63 THREADS=4
+       WINDOW_SIZE=32 KERNEL_SIZE=63 THREADS=4 GPU_LAYERS=0 STAGE2_BACKEND=cpu-reference|metal
 HELP
 }
 
@@ -66,7 +67,7 @@ build_stage2() (
         -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF
     cmake --build "$LLAMA/build" --target llama -j "$JOBS"
     make -C "$ROOT" runner test_rocket CXX="${CXX:-c++}"
-    echo "Built runner with llama.cpp $REVISION and CPU-reference HSA."
+    echo "Built runner with llama.cpp $REVISION and CPU/Metal HSA dispatch."
 )
 
 test_stage2() (
@@ -103,7 +104,7 @@ PY
     mkdir -p build
     SANITIZER_FLAGS=(-std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-unknown-pragmas
         "-fsanitize=${SANITIZERS:-undefined}" -fno-sanitize-recover=all -fno-omit-frame-pointer)
-    "${CXX:-c++}" "${SANITIZER_FLAGS[@]}" test_rocket.cpp rocket.cpp -o build/test_rocket_sanitized
+    "${CXX:-c++}" "${SANITIZER_FLAGS[@]}" -Iinclude tests/test_rocket.cpp src/rocket.cpp -o build/test_rocket_sanitized
     echo "Sanitizers: ${SANITIZERS:-undefined}"
     python3 - "$ROOT/build/test_rocket_sanitized" <<'PY'
 import subprocess
@@ -115,9 +116,18 @@ except subprocess.TimeoutExpired:
 PY
     bash -n "$ROOT/scripts/stage2.sh"
     python3 -m unittest discover -s tests -p 'test_*.py' -v
+    METAL_SOURCES=(src/metal/rocket_metal_stub.cpp)
+    METAL_FLAGS=()
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        "${CXX:-c++}" "${SANITIZER_FLAGS[@]}" -fobjc-arc \
+            -Iinclude -Ibuild -Illama.cpp/ggml/include -c src/metal/rocket_metal.mm -o build/rocket_metal_sanitized.o
+        METAL_SOURCES=(build/rocket_metal_sanitized.o)
+        METAL_FLAGS=(-framework Metal -framework Foundation)
+        if [[ "${ROCKET_TEST_METAL:-0}" == "1" ]]; then make test_metal; fi
+    fi
     "${CXX:-c++}" "${SANITIZER_FLAGS[@]}" \
-        -I. -Illama.cpp/include -Illama.cpp/ggml/include -Illama.cpp/vendor \
-        runner.cpp rocket.cpp rocket_adapter.cpp -o build/runner_sanitized \
+        -Iinclude -Ibuild -Illama.cpp/include -Illama.cpp/ggml/include -Illama.cpp/vendor \
+        src/runner.cpp src/rocket.cpp src/rocket_adapter.cpp "${METAL_SOURCES[@]}" "${METAL_FLAGS[@]}" -o build/runner_sanitized \
         -Lllama.cpp/build/bin -Wl,-rpath,"$ROOT/llama.cpp/build/bin" \
         -lllama -lggml -lggml-base -lggml-cpu
     ROCKET_RUNNER="$ROOT/build/runner_sanitized" \
@@ -150,21 +160,24 @@ with open(sys.argv[1], "w", encoding="utf-8") as f:
 PY
     fi
     for mode in off stage1 hsa; do
-        "$ROOT/runner" --model "$MODEL" --batch "$INPUT" --output "$OUTPUT/$mode.json" \
-            --rocket-mode "$mode" --kv-type f16 --gpu-layers 0 \
+        backend=cpu-reference
+        if [[ "$mode" == "hsa" ]]; then backend="${STAGE2_BACKEND:-cpu-reference}"; fi
+        "$ROOT/build/runner" --model "$MODEL" --batch "$INPUT" --output "$OUTPUT/$mode.json" \
+            --rocket-mode "$mode" --stage2-backend "$backend" --kv-type f16 --gpu-layers "${GPU_LAYERS:-0}" \
             --budget "${BUDGET:-128}" --n-ctx "${N_CTX:-2048}" \
             --context-len "${CONTEXT_LEN:-1024}" --max-tokens "${MAX_TOKENS:-32}" \
             --window-size "${WINDOW_SIZE:-32}" --kernel-size "${KERNEL_SIZE:-63}" \
             --threads "${THREADS:-4}"
     done
-    python3 - "$ROOT" "$MODEL" "$INPUT" "$OUTPUT" <<'PY'
+    python3 - "$ROOT" "$MODEL" "$INPUT" "$OUTPUT" "${STAGE2_BACKEND:-cpu-reference}" <<'PY'
 import json
 from pathlib import Path
 import subprocess
 import sys
-root, model, source, output = map(Path, sys.argv[1:])
+root, model, source, output = map(Path, sys.argv[1:5])
+expected_backend = sys.argv[5]
 samples = json.loads(source.read_text())
-print("\nCPU reference comparison (includes selection and packing overhead)")
+print("\nThree-mode comparison (includes HSA selection and packing overhead)")
 print(f"{'mode':<10} {'forwards':>10} {'ms/forward':>12} {'HSA layers':>12} {'init ms':>10}")
 for mode in ("off", "stage1", "hsa"):
     rows = json.loads((output / f"{mode}.json").read_text())
@@ -176,7 +189,7 @@ for mode in ("off", "stage1", "hsa"):
         m = row["metrics"]
         if m["effective_mode"] != mode:
             raise SystemExit(f"{mode}: wrong execution path")
-        if mode == "hsa" and (m["stage2_backend"] != "cpu-reference"
+        if mode == "hsa" and (m["stage2_backend"] != expected_backend
                 or m["stage2_layer_calls"] != m["model_layers"] * m["decode_forward_calls"]):
             raise SystemExit("HSA was not executed in every layer")
     steps = sum(row["metrics"]["decode_forward_calls"] for row in rows)
@@ -188,7 +201,9 @@ for mode in ("off", "stage1", "hsa"):
     if mode == "hsa" and not steps:
         raise SystemExit("No decode forward ran; use a different prompt or larger max_tokens")
 manifest = {
-    "model": str(model), "batch": str(source), "stage2_backend": "cpu-reference",
+    "model": str(model), "batch": str(source), "stage2_backend": rows[0]["metrics"]["stage2_backend"],
+    "requested_gpu_layers": rows[0]["metrics"]["requested_gpu_layers"],
+    "hsa_model_backend": rows[0]["metrics"]["model_backend"],
     "llama_revision": (root / "patches/llama.cpp-revision").read_text().strip(),
     "runner_base_commit": subprocess.check_output(
         ["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip(),

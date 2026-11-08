@@ -9,8 +9,8 @@ from typing import Dict, Any, List, Optional, Union
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "model": {
-        "path": "Llama-3.2-3B-Instruct-Q8_0.gguf",
-        "runner": "./runner",
+        "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+        "runner": "./build/runner",
         "max_tokens": 32,
         "n_ctx": 9216
     },
@@ -86,7 +86,7 @@ def load_config_file(config_path: Optional[str] = None) -> Dict[str, Any]:
         bench["tasks"] = [t.strip() for t in bench["tasks"].split(",") if t.strip()]
 
     # Resolve runner path if relative
-    runner = config["model"].get("runner", "./runner")
+    runner = config["model"].get("runner", "./build/runner")
     if not os.path.isabs(runner):
         candidates = [
             runner,
