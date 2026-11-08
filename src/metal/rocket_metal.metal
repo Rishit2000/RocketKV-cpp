@@ -4,7 +4,7 @@ using namespace metal;
 struct Params {
     uint dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded, topk_padded;
     uint qd, qh, kd, kt, kh, vd, vt, vh;
-    uint cached_count, mask_type, mask_stride;
+    uint cached_count, mask_type, mask_stride, sort_padded;
 };
 #define ARGS                                                                                                 \
     constant Params &p [[buffer(0)]], device const uchar *qr [[buffer(1)]],                                  \
@@ -178,7 +178,7 @@ kernel void softmax(ARGS, constant uint &width [[buffer(16)]], constant uint &ex
 
 template <typename Scores, typename Indices>
 inline void select_tokens_impl(constant Params &p, device const float *chunks, device uint *indices,
-                               Scores values, Indices ids, uint tid, uint group, mem_flags memory) {
+                               Scores values, Indices ids, uint tid, uint group, uint width, mem_flags memory) {
     if (p.topk == p.count) {
         for (uint i = tid; i < p.count; i += 256) {
             indices[group * p.padded + i] = i;
@@ -186,23 +186,31 @@ inline void select_tokens_impl(constant Params &p, device const float *chunks, d
         return;
     }
     uint nh = p.heads / p.kv_heads;
-    for (uint i = tid; i < p.padded; i += 256) {
+    for (uint i = tid; i < p.sort_padded; i += 256) {
         float score = 0;
-        if (i < p.count) {
+        if (i < p.chunks) {
             for (uint h = 0; h < nh; ++h) {
-                score += chunks[(group * nh + h) * p.chunks + i / p.chunk];
+                score += chunks[(group * nh + h) * p.chunks + i];
             }
         }
-        values[i] = i < p.count ? score : -INFINITY;
+        values[i] = i < p.chunks ? score : -INFINITY;
         ids[i] = i;
     }
     threadgroup_barrier(memory);
     // One threadgroup owns each KV group's sort; no cross-threadgroup barrier is needed.
-    for (uint size = 2; size <= p.padded; size *= 2) {
+    for (uint size = 2; size <= p.sort_padded; size *= 2) {
         for (uint stride = size / 2; stride; stride /= 2) {
-            for (uint i = tid; i < p.padded; i += 256) {
+            for (uint i = tid; i < p.sort_padded; i += 256) {
                 uint j = i ^ stride;
-                if (j > i) {
+                if (stride < width) {
+                    float value = values[i], other = simd_shuffle_xor(value, stride);
+                    uint id = ids[i], other_id = simd_shuffle_xor(id, stride);
+                    bool descending = ((i & size) == 0) == ((i & stride) == 0);
+                    if (descending ? better(other, other_id, value, id) : better(value, id, other, other_id)) {
+                        values[i] = other;
+                        ids[i] = other_id;
+                    }
+                } else if (j > i) {
                     bool swap = (i & size) == 0 ? better(values[j], ids[j], values[i], ids[i])
                                                 : better(values[i], ids[i], values[j], ids[j]);
                     if (swap) {
@@ -215,43 +223,58 @@ inline void select_tokens_impl(constant Params &p, device const float *chunks, d
                     }
                 }
             }
-            threadgroup_barrier(memory);
+            if (stride >= width || stride == 1) threadgroup_barrier(memory);
         }
     }
-    // Match the CPU reference's chronological order for exact attention accumulation.
-    for (uint i = tid; i < p.topk_padded; i += 256) {
-        if (i >= p.topk) {
-            ids[i] = 0xffffffffu;
+    // Tokens within a chunk share a score. Expand ranked chunks, accounting for the short tail.
+    const uint missing = p.chunks * p.chunk - p.count;
+    if (!missing) {
+        if (tid == 0) values[0] = float(p.count);
+    } else {
+        for (uint i = tid; i < p.chunks; i += 256) {
+            if (ids[i] == p.chunks - 1) values[0] = float(i * p.chunk);
         }
     }
     threadgroup_barrier(memory);
+    uint tail_start = uint(values[0]);
+    threadgroup_barrier(memory);
+    for (uint i = tid; i < p.topk_padded; i += 256) {
+        uint j = i + (i >= tail_start + p.chunk - missing ? missing : 0);
+        values[i] = i < p.topk ? float(ids[j / p.chunk] * p.chunk + j % p.chunk) : INFINITY;
+    }
+    threadgroup_barrier(memory);
+    // Candidate IDs <=32768 are exact in F32; reuse scores to sort IDs chronologically.
     for (uint size = 2; size <= p.topk_padded; size *= 2) {
         for (uint stride = size / 2; stride; stride /= 2) {
             for (uint i = tid; i < p.topk_padded; i += 256) {
                 uint j = i ^ stride;
-                if (j > i && ((i & size) == 0 ? ids[i] > ids[j] : ids[i] < ids[j])) {
-                    uint u = ids[i];
-                    ids[i] = ids[j];
-                    ids[j] = u;
+                if (stride < width) {
+                    float value = values[i], other = simd_shuffle_xor(value, stride);
+                    bool ascending = ((i & size) == 0) == ((i & stride) == 0);
+                    values[i] = ascending ? min(value, other) : max(value, other);
+                } else if (j > i && ((i & size) == 0 ? values[i] > values[j] : values[i] < values[j])) {
+                    float value = values[i];
+                    values[i] = values[j];
+                    values[j] = value;
                 }
             }
-            threadgroup_barrier(memory);
+            if (stride >= width || stride == 1) threadgroup_barrier(memory);
         }
     }
-    for (uint i = tid; i < p.topk; i += 256) indices[group * p.padded + i] = ids[i];
+    for (uint i = tid; i < p.topk; i += 256) indices[group * p.padded + i] = uint(values[i]);
 }
 
 kernel void select_tokens(ARGS, uint tid [[thread_index_in_threadgroup]],
-                          uint group [[threadgroup_position_in_grid]]) {
+                          uint group [[threadgroup_position_in_grid]], uint width [[threads_per_simdgroup]]) {
     select_tokens_impl(p, chunks, indices, scores + group * p.padded, indices + group * p.padded,
-                       tid, group, mem_flags::mem_device);
+                       tid, group, width, mem_flags::mem_device);
 }
 
 kernel void select_tokens_local(ARGS, threadgroup float *values [[threadgroup(0)]],
                                threadgroup uint *ids [[threadgroup(1)]],
                                uint tid [[thread_index_in_threadgroup]],
-                               uint group [[threadgroup_position_in_grid]]) {
-    select_tokens_impl(p, chunks, indices, values, ids, tid, group, mem_flags::mem_threadgroup);
+                               uint group [[threadgroup_position_in_grid]], uint width [[threads_per_simdgroup]]) {
+    select_tokens_impl(p, chunks, indices, values, ids, tid, group, width, mem_flags::mem_threadgroup);
 }
 
 kernel void exact_scores(ARGS, uint i [[thread_position_in_grid]]) {
@@ -272,7 +295,22 @@ kernel void weighted_sum(ARGS, uint i [[thread_position_in_grid]]) {
     }
     uint h = i / p.dim, d = i % p.dim, group = h / (p.heads / p.kv_heads);
     float sum = 0;
-    for (uint j = 0; j < p.topk; ++j) {
+    uint j = 0;
+    for (; j + 3 < p.topk; j += 4) {
+        uint s0 = uint(slots[indices[group * p.padded + j]]);
+        uint s1 = uint(slots[indices[group * p.padded + j + 1]]);
+        uint s2 = uint(slots[indices[group * p.padded + j + 2]]);
+        uint s3 = uint(slots[indices[group * p.padded + j + 3]]);
+        float v0 = read_kv(vr, group, s0, d, p.vh, p.vt, p.vd);
+        float v1 = read_kv(vr, group, s1, d, p.vh, p.vt, p.vd);
+        float v2 = read_kv(vr, group, s2, d, p.vh, p.vt, p.vd);
+        float v3 = read_kv(vr, group, s3, d, p.vh, p.vt, p.vd);
+        sum += exact[h * p.topk + j] * v0;
+        sum += exact[h * p.topk + j + 1] * v1;
+        sum += exact[h * p.topk + j + 2] * v2;
+        sum += exact[h * p.topk + j + 3] * v3;
+    }
+    for (; j < p.topk; ++j) {
         uint slot = uint(slots[indices[group * p.padded + j]]);
         sum += exact[h * p.topk + j] * read_kv(vr, group, slot, d, p.vh, p.vt, p.vd);
     }

@@ -20,13 +20,13 @@ void check(bool value, const char *message) {
 }
 
 void compare(RocketMetal &metal, int dim, int count, int chunk, int topk, bool zero_query = false,
-             bool tied = false, float key_scale = 1.0f) {
+             bool tied = false, float key_scale = 1.0f, bool tail_best = false) {
     RocketConfig cfg{};
     cfg.dim_head = dim;
     cfg.num_heads = 6;
     cfg.num_heads_kv = 2;
     cfg.chunk_size = chunk;
-    cfg.r_dim = dim / 2;
+    cfg.r_dim = std::max(1, dim / 2);
     cfg.compression_ratio = 2;
     cfg.topk_decode = topk;
     const int capacity = count * 2 + 3;
@@ -51,6 +51,14 @@ void compare(RocketMetal &metal, int dim, int count, int chunk, int topk, bool z
     std::vector<int> slots(count);
     for (int i = 0; i < count; ++i) {
         slots[i] = 2 * i + 1;
+    }
+    if (tail_best) {
+        std::fill_n(qp, dim * cfg.num_heads, 1.0f);
+        for (int h = 0; h < cfg.num_heads_kv; ++h) {
+            for (int t = (count - 1) / chunk * chunk; t < count; ++t) {
+                std::fill_n(kp + (size_t(h) * capacity + slots[t]) * dim, dim, ggml_fp32_to_fp16(10.0f));
+            }
+        }
     }
     std::vector<float> kc(size_t(count) * dim * cfg.num_heads_kv), vc(kc.size());
     for (int h = 0; h < cfg.num_heads_kv; ++h) {
@@ -301,9 +309,18 @@ int main() {
             reg ? ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr) : nullptr, ggml_backend_free);
         check(!reg || bool(backend), "Metal backend initialization failed");
         RocketMetal metal;
+        compare(metal, 1, 17, 3, 7);
+        compare(metal, 31, 33, 1, 17);
+        compare(metal, 33, 35, 4, 10);
         compare(metal, 16, 1, 1, 1);
         compare(metal, 16, 2, 1, 1);
         compare(metal, 16, 5, 3, 3);
+        for (int topk : {1, 3, 4, 6, 12}) compare(metal, 17, 13, 5, topk, false, false, 1.0f, true);
+        compare(metal, 17, 13, 32, 5);
+        compare(metal, 64, 4096, 1, 512);
+        compare(metal, 64, 4097, 1, 512);
+        compare(metal, 16, 4097, 3, 4097);
+        compare(metal, 16, 1300, 3, 1299);
         compare(metal, 64, 257, 3, 17);
         compare(metal, 128, 513, 2, 256);
         compare(metal, 128, 4096, 3, 512);
