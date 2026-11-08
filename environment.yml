@@ -12,3 +12,6 @@ dependencies:
       - transformers
       - tiktoken
       - numpy
+      - rouge==1.0.1
+      - fuzzywuzzy==0.18.0
+      - python-Levenshtein==0.27.1
