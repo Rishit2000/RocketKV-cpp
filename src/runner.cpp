@@ -522,7 +522,8 @@ static nlohmann::json metrics_to_json(
     const std::string & kv_type_str,
     RocketMode mode,
     int token_budget,
-    bool full_attention
+    bool full_attention,
+    const std::string& stage2_backend
 ) {
     return {
         {"ttft_ms", res.ttft_ms},
@@ -542,7 +543,7 @@ static nlohmann::json metrics_to_json(
         {"requested_mode", mode_name(mode)},
         {"effective_mode", mode_name(mode)},
         {"stage1_policy", mode == RocketMode::Off ? "none" : "legacy-global"},
-        {"stage2_backend", mode == RocketMode::Hsa ? "cpu-reference" : "none"},
+        {"stage2_backend", mode == RocketMode::Hsa ? stage2_backend : "none"},
         {"hsa_full_attention", full_attention},
         {"native_f32_reference", res.native_f32_reference},
         {"stage2_init_ms", res.stage2_init_ms},
@@ -607,7 +608,8 @@ static int run_main(int argc, char ** argv) {
                       << "  --budget N --kv-type f16|q8_0|q4_0 --max-tokens N\n"
                       << "  --n-ctx N --context-len N --window-size N --kernel-size N\n"
                       << "  --threads N --ubatch N --gpu-layers N\n"
-                      << "  --stage2-backend cpu-reference (HSA requires F16 KV and CPU)\n"
+                      << "  HSA model placement: --gpu-layers 0 for CPU; positive values or -1 for Metal\n"
+                      << "  --stage2-backend cpu-reference|metal (F16 KV; default cpu-reference)\n"
                       << "  --hsa-full                   diagnostic: select all live candidates\n"
                       << "  --reference-f32              diagnostic native F32 decode, requires --trace-logits\n"
                       << "  --trace-logits               include token IDs/logits; allows batch forced_tokens\n";
@@ -657,13 +659,14 @@ static int run_main(int argc, char ** argv) {
         kernel_size % 2 == 0 || threads < 1 || ubatch < 1 || gpu_layers < -2) {
         throw std::invalid_argument("Invalid budget, context, window, thread, or batch size");
     }
-    if (stage2_backend != "cpu-reference") throw std::invalid_argument("Only stage2 backend cpu-reference is implemented");
+    if (stage2_backend != "cpu-reference" && stage2_backend != "metal") throw std::invalid_argument("Unknown stage2 backend");
+    if (stage2_backend == "metal" && mode != RocketMode::Hsa) throw std::invalid_argument("Metal stage2 backend requires --rocket-mode hsa");
     if (full_attention && mode != RocketMode::Hsa) throw std::invalid_argument("--hsa-full requires --rocket-mode hsa");
     if (mode == RocketMode::Hsa) {
-        if (kv_type_str != "f16" || token_budget < 1 || (gpu_layers != -2 && gpu_layers != 0)) {
-            throw std::invalid_argument("CPU-reference HSA requires F16 KV, positive budget, and --gpu-layers 0");
+        if (kv_type_str != "f16" || token_budget < 1) {
+            throw std::invalid_argument("HSA requires F16 KV and positive budget");
         }
-        gpu_layers = 0;
+        if (gpu_layers == -2) gpu_layers = stage2_backend == "metal" ? -1 : 0;
     }
     if (native_f32_reference) {
         if (!trace_logits || mode == RocketMode::Hsa || kv_type_str != "f16" ||
@@ -681,6 +684,25 @@ static int run_main(int argc, char ** argv) {
         ~BackendGuard() { llama_backend_free(); }
     } backend_guard;
     llama_model_params model_params = llama_model_default_params();
+    ggml_backend_dev_t metal_devices[] = {nullptr, nullptr};
+    const bool offloaded_hsa = mode == RocketMode::Hsa && gpu_layers != 0;
+    if (offloaded_hsa) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            auto device = ggml_backend_dev_get(i);
+            const auto type = ggml_backend_dev_type(device);
+            if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+                std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "MTL") == 0) {
+                metal_devices[0] = device;
+                break;
+            }
+        }
+        if (!metal_devices[0]) {
+            throw std::invalid_argument("HSA model offload requires an available Metal GPU; use --gpu-layers 0 for CPU");
+        }
+        model_params.devices = metal_devices;
+        std::cerr << "HSA model offload on " << ggml_backend_dev_description(metal_devices[0])
+                  << " (Metal), HSA backend: " << stage2_backend << "\n";
+    }
     if (gpu_layers != -2) model_params.n_gpu_layers = gpu_layers;
     std::unique_ptr<llama_model, decltype(&llama_model_free)> model_owner(
         llama_model_load_from_file(model_path.c_str(), model_params), llama_model_free);
@@ -727,7 +749,7 @@ static int run_main(int argc, char ** argv) {
     config.window_size = window_size;
     config.kernel_size = kernel_size;
     std::unique_ptr<RocketAdapter> adapter;
-    if (mode == RocketMode::Hsa) adapter = std::make_unique<RocketAdapter>(ctx, llama_model_n_layer(model));
+    if (mode == RocketMode::Hsa) adapter = std::make_unique<RocketAdapter>(ctx, llama_model_n_layer(model), stage2_backend == "metal");
 
     float bytes_per_elem = 2.0f;
     if (kv_type == GGML_TYPE_Q8_0) bytes_per_elem = 34.0f / 32.0f;
@@ -761,7 +783,12 @@ static int run_main(int argc, char ** argv) {
             item_out["sample_id"] = item.value("sample_id", i + 1);
             item_out["generated"] = res.text;
             item_out["status"] = "ok";
-            item_out["metrics"] = metrics_to_json(res, kv_type_str, mode, token_budget, full_attention);
+            item_out["metrics"] = metrics_to_json(res, kv_type_str, mode, token_budget, full_attention, stage2_backend);
+            item_out["metrics"]["requested_gpu_layers"] = gpu_layers == -2
+                ? nlohmann::json(nullptr) : nlohmann::json(gpu_layers);
+            item_out["metrics"]["model_backend"] = offloaded_hsa ? "metal" : (gpu_layers == 0 ? "cpu" : "auto");
+            item_out["metrics"]["model_gpu_device"] = offloaded_hsa
+                ? nlohmann::json(ggml_backend_dev_description(metal_devices[0])) : nlohmann::json(nullptr);
             if (trace_logits) {
                 item_out["token_ids"] = res.token_ids;
                 item_out["logits"] = res.logits;

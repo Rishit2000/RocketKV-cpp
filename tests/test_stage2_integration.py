@@ -9,7 +9,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = Path(os.environ.get("ROCKET_TEST_MODEL", ROOT / "models/stories260K.gguf")).resolve()
-RUNNER = Path(os.environ.get("ROCKET_RUNNER", ROOT / "runner")).resolve()
+RUNNER = Path(os.environ.get("ROCKET_RUNNER", ROOT / "build" / "runner")).resolve()
 PROMPT = (
     "Alice keeps the blue key in a wooden box. Bob has a red bicycle. "
     "The bird found a golden coin beside the river. "
@@ -117,10 +117,10 @@ class Stage2IntegrationTests(unittest.TestCase):
                 self.assertLessEqual(abs(a - b), tolerance + tolerance * abs(b))
         return maximum
 
-    def assert_hsa_calls(self, result, steps):
+    def assert_hsa_calls(self, result, steps, backend="cpu-reference"):
         metrics = result["metrics"]
         self.assertEqual(metrics["effective_mode"], "hsa")
-        self.assertEqual(metrics["stage2_backend"], "cpu-reference")
+        self.assertEqual(metrics["stage2_backend"], backend)
         self.assertEqual(metrics["decode_forward_calls"], steps)
         self.assertEqual(metrics["stage2_layer_calls"], metrics["model_layers"] * steps)
         self.assertEqual(metrics["stage2_calls_per_layer"], [steps] * metrics["model_layers"])
@@ -196,8 +196,7 @@ class Stage2IntegrationTests(unittest.TestCase):
         sample = self.sample(tokens=FORCED[:2])
         cases = [
             (["--kv-type", "q8_0"], "requires F16"),
-            (["--stage2-backend", "metal"], "Only stage2 backend"),
-            (["--gpu-layers", "1"], "requires F16"),
+            (["--stage2-backend", "unknown"], "Unknown stage2 backend"),
             (["--rocket", "1"], "Do not combine"),
             (["--budget", "0"], "requires F16"),
             (["--n-ctx", "8", "--context-len", "0"], "exceeds --n-ctx"),
@@ -209,6 +208,82 @@ class Stage2IntegrationTests(unittest.TestCase):
                 self.run_batch([sample], extra=options, error=message)
         self.run_batch([dict(sample, max_tokens=0)], error="Invalid generation length")
         self.run_batch([dict(sample, forced_tokens=[-1, 10])], error="Invalid or EOG forced token")
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on a Metal GPU build")
+    def test_metal_full_selection_matches_cpu(self):
+        # Keep every prompt position so small CPU/Metal prefill differences cannot
+        # change the Stage 1 eviction boundary used for numerical comparison.
+        sample = self.sample()
+        options = ["--hsa-full", "--window-size", "512"]
+        cpu = self.run_batch([sample], extra=options)[0]
+        metal = self.run_batch([sample], extra=options + ["--gpu-layers", "99"])[0]
+        self.assertEqual(cpu["kept_positions"], metal["kept_positions"])
+        self.assertEqual(metal["metrics"]["model_backend"], "metal")
+        self.assertTrue(metal["metrics"]["model_gpu_device"])
+        self.assertEqual(metal["metrics"]["requested_gpu_layers"], 99)
+        self.assert_hsa_calls(metal, len(FORCED) - 1)
+        # Quantized model matmuls differ between CPU and Metal even without
+        # Rocket. Bound hybrid numerical drift against that native baseline.
+        native_cpu = self.run_batch([sample], "off")[0]
+        native_metal = self.run_batch([sample], "off", ["--gpu-layers", "99"])[0]
+
+        def flatten(values):
+            for value in values:
+                if isinstance(value, list):
+                    yield from flatten(value)
+                else:
+                    yield value
+
+        def relative_error(left, right):
+            left, right = list(flatten(left)), list(flatten(right))
+            self.assertEqual(len(left), len(right))
+            self.assertTrue(all(math.isfinite(x) for x in left + right))
+            self.assertLess(max(abs(a - b) for a, b in zip(left, right)), 0.05)
+            return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)) /
+                             max(sum(b * b for b in right), 1e-12))
+
+        for field in ("attention", "logits"):
+            baseline = relative_error(native_metal[field], native_cpu[field])
+            hybrid = relative_error(metal[field], cpu[field])
+            self.assertLessEqual(hybrid, max(1e-4, baseline * 1.5))
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on a Metal GPU build")
+    def test_metal_sparse_batch_state_isolation(self):
+        samples = [self.sample(), self.sample(prompt="The bird found a coin.", tokens=FORCED[:3], sample_id=2)]
+        options = ["--gpu-layers", "99"]
+        together = self.run_batch(samples, extra=options)
+        for sample, result in zip(samples, together):
+            alone = self.run_batch([sample], extra=options)[0]
+            self.assert_hsa_calls(result, len(sample["forced_tokens"]) - 1)
+            self.assertEqual(result["kept_positions"], alone["kept_positions"])
+            self.assert_close(result["logits"], alone["logits"], 2e-4)
+        m = together[0]["metrics"]
+        self.assertLess(m["stage2_selected_max"], m["stage2_candidate_min"])
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on macOS")
+    def test_metal_kernel_matches_cpu_reference(self):
+        for full in (False, True):
+            with self.subTest(full=full):
+                options = ["--hsa-full"] if full else []
+                sample = self.sample()
+                cpu = self.run_batch([sample], extra=options)[0]
+                gpu = self.run_batch([sample], extra=options + ["--stage2-backend", "metal"])[0]
+                self.assertEqual(cpu["kept_positions"], gpu["kept_positions"])
+                self.assert_hsa_calls(gpu, len(FORCED) - 1, "metal")
+                self.assert_close(gpu["attention"], cpu["attention"], 2e-4)
+                self.assert_close(gpu["logits"], cpu["logits"], 2e-4)
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on macOS")
+    def test_metal_kernel_with_model_offload_and_reset(self):
+        samples = [self.sample(), self.sample(prompt="The bird found a coin.", tokens=FORCED[:3], sample_id=2)]
+        options = ["--stage2-backend", "metal", "--gpu-layers", "99"]
+        together = self.run_batch(samples, extra=options)
+        for sample, result in zip(samples, together):
+            alone = self.run_batch([sample], extra=options)[0]
+            self.assert_hsa_calls(result, len(sample["forced_tokens"]) - 1, "metal")
+            self.assertEqual(result["metrics"]["model_backend"], "metal")
+            self.assertEqual(result["kept_positions"], alone["kept_positions"])
+            self.assert_close(result["logits"], alone["logits"], 2e-4)
 
 
 if __name__ == "__main__":

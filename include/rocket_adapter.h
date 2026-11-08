@@ -2,6 +2,7 @@
 
 #include "llama-rocket.h"
 #include "rocket.h"
+#include "rocket_metal.h"
 
 #include <cstdint>
 #include <string>
@@ -18,7 +19,7 @@ struct RocketStage2Stats {
 
 class RocketAdapter {
 public:
-    RocketAdapter(llama_context* ctx, int layer_count);
+    RocketAdapter(llama_context* ctx, int layer_count, bool metal = false);
     ~RocketAdapter();
     RocketAdapter(const RocketAdapter&) = delete;
     RocketAdapter& operator=(const RocketAdapter&) = delete;
@@ -43,6 +44,7 @@ private:
     void refresh_slots();
 
     llama_context* ctx_;
+    std::unique_ptr<RocketMetal> metal_;
     RocketConfig config_{};
     RocketStage2Stats stats_;
     std::vector<Layer> layers_;

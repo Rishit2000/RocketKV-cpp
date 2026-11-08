@@ -2,41 +2,32 @@
 
 C++17 implementation of **RocketKV** prefill eviction and hybrid sparse decode, integrated with a pinned, patched [`llama.cpp`](https://github.com/ggerganov/llama.cpp).
 
-> **Current status:** Stage 1 + Stage 2 is connected to real model inference as a **CPU reference** for supported single-sequence Llama models with F16 KV. There is no Metal HSA kernel or multi-turn support yet. The included small-model tests establish correctness, not a large-model speedup or quality claim.
+> **Current status:** Stage 1 + Stage 2 supports CPU-reference and Metal HSA for single-sequence Llama models with F16 KV. The Metal backend executes candidate packing, approximate scoring, deterministic Top-K selection and exact sparse attention on GPU. Stage 1 eviction and KV position bookkeeping remain on CPU. Multi-turn inference is not supported.
 
 ---
 
 ## Repository Structure
 
-```
+```text
 RocketKV-cpp/
-├── rocket.h / rocket.cpp       # Budget policy, Stage 1 eviction, Stage 2 CPU algorithm
-├── rocket_adapter.h / rocket_adapter.cpp # GGML node, KV mapping, tensor packing
-├── runner.cpp                  # Mode selection, inference loop, errors, metrics
-├── test_rocket.cpp             # Deterministic algorithm and boundary tests
-├── tests/
-│   └── test_stage2_integration.py # Real-model equivalence and script-entry tests
-├── patches/
-│   ├── llama.cpp-revision     # Pinned upstream commit
-│   └── llama-stage2.patch     # Context hooks and attention graph integration
-├── Makefile                    # Incremental runner and algorithm-test builds
-├── eval.py                     # Legacy Python benchmark driver (Stage 1 only for Rocket)
-├── eval_suite/                 # Benchmarking orchestration & scoring engine
-│   ├── engine.py               # Metric aggregation & comparison table renderer
-│   ├── runner.py               # Process batch runner client
-│   ├── datasets.py             # LongBench loader & RULER procedural generator
-│   ├── metrics.py              # Official scoring metrics (F1, ROUGE, EM, etc.)
-│   └── config.py               # Declarative JSON configuration parser
-├── configs/                    # Experiment configuration files
-│   ├── longbench.json          # LongBench subset (4 tasks, 30 samples/task, 8k context)
-│   ├── ruler.json              # NVIDIA RULER synthetic benchmark (13 tasks)
-│   └── default.json            # Fast sanity check config
-├── scripts/
-│   ├── stage2.sh               # Single entry point: build / test / run
-│   ├── download_model.sh       # Script to fetch Llama-3.2 GGUF weights
-│   ├── download_longbench.sh   # Script to download LongBench JSONL datasets
-│   └── prepare_ruler_data.py   # RULER synthetic dataset generator
-└── environment.yml             # Conda environment definition
+├── include/                   # Public C++ interfaces
+├── src/
+│   ├── runner.cpp             # Model loading, modes, inference loop and metrics
+│   ├── rocket.cpp             # CPU reference algorithms
+│   ├── rocket_adapter.cpp     # GGML graph integration and KV position mapping
+│   └── metal/                 # Metal kernels, dispatch wrapper and non-macOS stub
+├── tests/                     # CPU/Metal kernel tests and model integration tests
+├── scripts/                   # Build/test/run entry point and download helpers
+├── configs/                   # Benchmark configurations
+├── eval.py / eval_suite/      # Legacy Python evaluation pipeline
+├── patches/                   # Pinned llama.cpp revision and integration patch
+├── Makefile
+├── environment.yml
+├── llama.cpp/                 # Downloaded upstream checkout (ignored)
+├── build/                     # Binaries, generated shaders and objects (ignored)
+├── models/                    # Downloaded GGUF models (ignored)
+├── data/                      # Evaluation datasets (ignored)
+└── results/                   # Experiment outputs and logs (ignored)
 ```
 
 ---
@@ -45,10 +36,11 @@ RocketKV-cpp/
 
 | Component | Responsibility |
 |---|---|
-| `runner.cpp` | Select `off`, `stage1`, or `hsa`; hand over retained positions; manage request state and report actual forward/layer calls. |
-| `rocket_adapter.cpp/.h` | Read each layer's real KV cache, map positions to live slots, pack tensors, and call the existing sparse attention algorithm from a GGML CPU node. |
+| `src/runner.cpp` | Select `off`, `stage1`, or `hsa`; hand over retained positions; manage request state and report actual forward/layer calls. |
+| `src/rocket_adapter.cpp`, `include/rocket_adapter.h` | Read each layer's real KV cache, map positions to live slots, pack tensors, and call the existing sparse attention algorithm from a GGML CPU node. |
+| `src/metal/`, `include/rocket_metal.h` | Metal HSA kernels and synchronous GPU dispatch. |
 | `patches/llama-stage2.patch` | Add context-scoped hooks and KV-position access; replace decode attention inside the graph; prevent stale graph reuse after mode changes. |
-| `rocket.cpp/.h` | Retain the algorithm structure while adding input checks, short-prompt/zero-query fixes, deterministic top-r ties, and optional selection output for tests. |
+| `src/rocket.cpp`, `include/rocket.h` | Retain the algorithm structure while adding input checks, short-prompt/zero-query fixes, deterministic top-r ties, and optional selection output for tests. |
 
 ```text
 Native prefill -> Stage 1 prompt-KV eviction -> initialize adapter
@@ -74,7 +66,7 @@ git clone --branch xiang/dev https://github.com/Rishit2000/RocketKV-cpp.git
 cd RocketKV-cpp
 ```
 
-Build requirements: Git, CMake, `make`, and a C++17 compiler. The test/run entry points also use Python 3; downloading the test model requires `curl`.
+Build requirements: Git, CMake, `make`, and a C++17 compiler. Python 3 embeds the Metal shader during macOS builds and runs the test/run entry points; downloading the test model requires `curl`.
 
 ### 2. Set Up the Python Evaluation Environment (Optional)
 
@@ -103,7 +95,7 @@ RocketKV links against a pinned, patched `llama.cpp`. The build script checks th
 bash scripts/stage2.sh build
 ```
 
-The revision and patch are stored in `patches/`. Existing checkouts at another revision or with conflicting edits are rejected, not reset. `JOBS=4` is the default build parallelism; Metal is enabled on macOS, but Stage 2 currently executes on CPU.
+The revision and patch are stored in `patches/`. Existing checkouts at another revision or with conflicting edits are rejected, not reset. `JOBS=4` is the default build parallelism; Metal model offload is enabled on macOS. Stage 2 uses the CPU reference by default; select `--stage2-backend metal` for GPU HSA.
 
 ---
 
@@ -119,7 +111,7 @@ To run unit tests verifying the RocketKV eviction kernel:
 
 ```bash
 make test_rocket
-./test_rocket
+./build/test_rocket
 ```
 
 ### Stage 2: build, test, and run
@@ -138,20 +130,35 @@ bash scripts/stage2.sh run /path/to/llama-model.gguf
 bash scripts/stage2.sh run /path/to/llama-model.gguf samples.json results/my-stage2-run
 ```
 
-`scripts/stage2.sh` is the single Stage 2 entry point; `--help` lists its build/test/run subcommands and environment overrides. Both test and run build automatically. Results include actual per-layer HSA calls, selected/candidate counts, initialization time, and latency per decode forward. KV size fields are logical estimates, not measured backend allocations. The Python evaluation suite keeps its original modes; use the runner or this script for HSA.
+`scripts/stage2.sh` is the single Stage 2 entry point; `--help` lists its build/test/run subcommands and environment overrides. Both test and run build automatically. Results include actual per-layer HSA calls, selected/candidate counts, initialization time, latency per decode forward, requested GPU layers, and the HSA model backend/device. KV size fields are logical estimates, not measured backend allocations. The Python evaluation suite keeps its original modes; use the runner or this script for HSA.
 
 | Runner mode | Prefill / eviction | Decode attention |
 |---|---|---|
 | `--rocket-mode off` | Native prefill, no eviction | Native |
 | `--rocket-mode stage1` | Native prefill + Stage 1 eviction | Native |
-| `--rocket-mode hsa` | Native prefill + the same Stage 1 eviction | CPU-reference HSA |
+| `--rocket-mode hsa` | Native prefill + the same Stage 1 eviction | CPU-reference or Metal HSA |
 
-Legacy `--rocket 0/1` still selects off/stage1; do not combine it with `--rocket-mode`. HSA requires F16 **KV**, not necessarily F16 model weights. Unsupported model/backend/type combinations fail explicitly. The comparison script forces all three modes to CPU/F16 KV.
+Legacy `--rocket 0/1` still selects off/stage1; do not combine it with `--rocket-mode`. HSA requires F16 **KV**, not necessarily F16 model weights. The default remains CPU-reference HSA. Use `--stage2-backend metal` for GPU HSA, and `--gpu-layers 99` for Metal model layers. With Metal HSA, omitted `--gpu-layers` defaults to all model layers on Metal; an explicit `--gpu-layers 0` keeps model computation on CPU for kernel comparisons. Unsupported backends fail explicitly, with no silent CPU fallback.
+
+```bash
+# Three-way comparison, with model layers and Stage 2 HSA on Metal.
+STAGE2_BACKEND=metal GPU_LAYERS=99 THREADS=16 BUDGET=1024 N_CTX=9216 CONTEXT_LEN=8192 \
+  bash scripts/stage2.sh run /path/to/llama-model.gguf samples.json results/stage2-metal
+
+# CPU, Metal, direct kernel comparisons, and UBSan regression tests.
+ROCKET_TEST_METAL=1 bash scripts/stage2.sh test
+```
+
+The Metal implementation is isolated in `src/metal/`; `src/rocket.cpp` remains the CPU reference. Kernels are embedded into the binary at build time, so execution does not depend on the working directory. The adapter keeps the existing GGML CPU callback as a synchronous dispatch boundary: the scheduler provides host-readable inputs, the Metal wrapper copies their raw bytes to reusable shared buffers, and GPU kernels pack candidates and compute attention. One command buffer completes per layer before returning its output. This first implementation still has staging and synchronization overhead; it is not a fully asynchronous GGML Metal operator.
+
+Supported Metal shapes are head dimensions 1–256, up to 256 query heads per KV group, and 1–32,768 live candidates, with F32 Q and F16 K/V. Unsupported shapes and non-finite input/output fail explicitly. The shader uses F32 accumulation and deterministic score/index tie-breaking; floating-point reduction order can differ from the CPU reference, particularly near selection boundaries. Full-model quantized CPU/Metal math also differs. Tests compare selected indices and attention on controlled inputs, and layer outputs/logits in real-model integration tests.
+
+`stage2_backend: "metal"` records GPU HSA execution; `model_backend` separately records model placement. CPU model + Metal HSA is supported for diagnostics. Metal model + `cpu-reference` HSA remains available as a hybrid baseline.
 
 To run **only HSA** on an existing batch, rather than all three comparison modes:
 
 ```bash
-./runner --model /path/to/llama-model.gguf --batch samples.json \
+./build/runner --model /path/to/llama-model.gguf --batch samples.json \
   --rocket-mode hsa --kv-type f16 --gpu-layers 0 --budget 1024 \
   --n-ctx 9216 --context-len 8192 --output hsa-results.json
 ```
@@ -162,7 +169,7 @@ The batch input is a JSON array, for example:
 [{"sample_id": 1, "prompt": "Once upon a time", "max_tokens": 32}]
 ```
 
-The built-in demonstration is a smoke test, not a LongBench/RULER accuracy evaluation. `test` covers algorithm boundaries, all-candidate attention/logit equivalence, sparse graph connectivity, state isolation, legacy modes, failure cases, and script dispatch. The reference currently packs candidate K/V on CPU and recomputes chunk information each step; persistent summaries and backend optimization remain future work.
+The built-in demonstration is a smoke test, not a LongBench/RULER accuracy evaluation. `test` covers algorithm boundaries, all-candidate attention/logit equivalence, sparse graph connectivity, state isolation, legacy modes, failure cases, and script dispatch. Both backends recompute chunk information each step; persistent summaries and asynchronous backend integration remain future work.
 
 The test script uses UBSan by default. To also run ASan, set `SANITIZERS=address,undefined` and select a compatible compiler with `CXX`. On the development machine, Apple's ASan runtime deadlocked before `main()`; that run was stopped and is not reported as passing. Sanitizer runs have a timeout rather than hanging indefinitely.
 
@@ -178,7 +185,7 @@ Download the quantized `Llama-3.2-3B-Instruct-Q8_0.gguf` model using the helper 
 bash scripts/download_model.sh
 ```
 
-*(Alternatively, download any compatible Llama-3.2 GGUF file from Hugging Face into the root directory.)*
+*(Alternatively, download any compatible Llama-3.2 GGUF file from Hugging Face into `models/`.)*
 
 ---
 
@@ -231,8 +238,8 @@ Legacy Python benchmark parameters are defined in declarative JSON files under `
 ```json
 {
   "model": {
-    "path": "Llama-3.2-3B-Instruct-Q8_0.gguf",
-    "runner": "./runner",
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "runner": "./build/runner",
     "max_tokens": 32,
     "n_ctx": 9216
   },

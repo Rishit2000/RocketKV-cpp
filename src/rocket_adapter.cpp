@@ -36,10 +36,11 @@ void update_range(int value, int& minimum, int& maximum) {
 
 } // namespace
 
-RocketAdapter::RocketAdapter(llama_context* ctx, int layer_count) : ctx_(ctx) {
+RocketAdapter::RocketAdapter(llama_context* ctx, int layer_count, bool metal) : ctx_(ctx) {
     if (!ctx || layer_count <= 0 || llama_rocket_abi_version() != LLAMA_ROCKET_ABI_VERSION) {
         throw std::runtime_error("Missing or incompatible llama.cpp Rocket extension");
     }
+    if (metal) metal_ = std::make_unique<RocketMetal>();
     layers_.reserve(layer_count);
     for (int i = 0; i < layer_count; ++i) layers_.push_back({this, i});
     reset();
@@ -137,7 +138,7 @@ ggml_tensor* RocketAdapter::build_attention(
         k->ne[0] != cfg.dim_head || k->ne[2] != cfg.num_heads_kv || k->ne[3] != 1 ||
         !ggml_are_same_shape(k, v) || mask->ne[0] != k->ne[1] ||
         std::abs(scale - 1.0f / std::sqrt((float)cfg.dim_head)) > 1e-6f) {
-        throw std::runtime_error("Unsupported tensor shape, type, or attention scale for CPU HSA");
+        throw std::runtime_error("Unsupported tensor shape, type, or attention scale for HSA");
     }
     ggml_tensor* args[] = {q, k, v, mask};
     auto* out = ggml_custom_4d(graph_ctx, GGML_TYPE_F32, cfg.dim_head, cfg.num_heads, 1, 1,
@@ -169,32 +170,36 @@ void RocketAdapter::compute_layer(ggml_tensor* dst, int layer) {
     if (layer == 0) refresh_slots();
     const int count = (int)slots_.size();
     const int dim = config_.dim_head;
-    q_.resize((size_t)config_.num_heads * dim);
-    k_.resize((size_t)config_.num_heads_kv * count * dim);
-    v_.resize(k_.size());
     for (int i = 0; i < count; ++i) {
         if (tensor_value(dst->src[3], slots_[i]) != 0.0f) {
             throw std::runtime_error("Candidate is masked or uses unsupported attention bias");
         }
     }
-    for (int h = 0; h < config_.num_heads; ++h) {
-        for (int d = 0; d < dim; ++d) {
-            q_[(size_t)h * dim + d] = tensor_value(dst->src[0], d, 0, h);
-        }
-    }
-    for (int h = 0; h < config_.num_heads_kv; ++h) {
-        for (int i = 0; i < count; ++i) {
-            for (int d = 0; d < dim; ++d) {
-                const size_t index = ((size_t)h * count + i) * dim + d;
-                k_[index] = tensor_value(dst->src[1], d, slots_[i], h);
-                v_[index] = tensor_value(dst->src[2], d, slots_[i], h);
-            }
-        }
-    }
     auto cfg = config_;
     if (full_attention_) cfg.topk_decode = count;
-    const auto output = compute_hybrid_sparse_decode(q_.data(), k_.data(), v_.data(), count, cfg);
-    std::memcpy(dst->data, output.data(), output.size() * sizeof(float));
+    if (metal_) {
+        metal_->compute(dst->src[0], dst->src[1], dst->src[2], slots_, cfg, static_cast<float*>(dst->data));
+    } else {
+        q_.resize((size_t)config_.num_heads * dim);
+        k_.resize((size_t)config_.num_heads_kv * count * dim);
+        v_.resize(k_.size());
+        for (int h = 0; h < config_.num_heads; ++h) {
+            for (int d = 0; d < dim; ++d) {
+                q_[(size_t)h * dim + d] = tensor_value(dst->src[0], d, 0, h);
+            }
+        }
+        for (int h = 0; h < config_.num_heads_kv; ++h) {
+            for (int i = 0; i < count; ++i) {
+                for (int d = 0; d < dim; ++d) {
+                    const size_t index = ((size_t)h * count + i) * dim + d;
+                    k_[index] = tensor_value(dst->src[1], d, slots_[i], h);
+                    v_[index] = tensor_value(dst->src[2], d, slots_[i], h);
+                }
+            }
+        }
+        const auto output = compute_hybrid_sparse_decode(q_.data(), k_.data(), v_.data(), count, cfg);
+        std::memcpy(dst->data, output.data(), output.size() * sizeof(float));
+    }
     ++stats_.layer_calls;
     ++stats_.calls_per_layer[layer];
     update_range(count, stats_.candidate_min, stats_.candidate_max);
