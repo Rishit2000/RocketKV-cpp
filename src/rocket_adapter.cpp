@@ -54,6 +54,8 @@ void RocketAdapter::reset() {
     if (!llama_set_rocket_attention(ctx_, nullptr, nullptr)) {
         throw std::runtime_error("Could not disable HSA");
     }
+    if (metal_) metal_->reset();
+    for (auto& layer : layers_) layer.k = layer.v = nullptr;
     active_ = false;
     step_pending_ = false;
     next_layer_ = 0;
@@ -125,6 +127,7 @@ void RocketAdapter::finish_step() const {
     if (step_pending_ || next_layer_ != 0) {
         throw std::runtime_error("HSA did not execute every model layer");
     }
+    if (metal_) metal_->check_errors();
 }
 
 ggml_tensor* RocketAdapter::build_attention(
@@ -141,8 +144,18 @@ ggml_tensor* RocketAdapter::build_attention(
         throw std::runtime_error("Unsupported tensor shape, type, or attention scale for HSA");
     }
     ggml_tensor* args[] = {q, k, v, mask};
+    auto& state = self.layers_[layer];
+    state.k = state.v = nullptr;
     auto* out = ggml_custom_4d(graph_ctx, GGML_TYPE_F32, cfg.dim_head, cfg.num_heads, 1, 1,
-                               args, 4, compute, 1, &self.layers_[layer]);
+                               args, 4, compute, 1, &state);
+    if (self.metal_ && !self.metal_->attach(out, encode, &state) &&
+        self.metal_->can_bind(k) && self.metal_->can_bind(v)) {
+        state.k = k;
+        state.v = v;
+        // Keep scheduler dependencies without copying the full KV tensors to CPU.
+        out->src[1] = ggml_view_1d(graph_ctx, k, 1, 0);
+        out->src[2] = ggml_view_1d(graph_ctx, v, 1, 0);
+    }
     ggml_format_name(out, "rocket_hsa-%d", layer);
     return out;
 }
@@ -151,34 +164,48 @@ void RocketAdapter::compute(ggml_tensor* dst, int ith, int nth, void* user_data)
     (void)nth;
     if (ith != 0) return;
     auto& layer = *static_cast<Layer*>(user_data);
-    auto& self = *layer.owner;
+    layer.owner->execute(dst, layer.index, nullptr);
+}
+
+void RocketAdapter::encode(ggml_tensor* dst, void* encoder, void* user_data) {
+    auto& layer = *static_cast<Layer*>(user_data);
+    layer.owner->execute(dst, layer.index, encoder);
+}
+
+void RocketAdapter::execute(ggml_tensor* dst, int layer, void* encoder) {
+    // GGML may encode different command buffers on concurrent host threads.
+    std::lock_guard<std::mutex> lock(encode_mutex_);
     try {
-        if (!self.error_.empty()) throw std::runtime_error(self.error_);
-        self.compute_layer(dst, layer.index);
+        if (!error_.empty()) throw std::runtime_error(error_);
+        compute_layer(dst, layer, encoder);
     } catch (const std::exception& error) {
         // Exceptions must not cross GGML's worker boundary.
-        if (self.error_.empty()) self.error_ = "HSA layer " + std::to_string(layer.index) + ": " + error.what();
-        std::fill_n(static_cast<float*>(dst->data), ggml_nelements(dst),
-                    std::numeric_limits<float>::quiet_NaN());
+        if (error_.empty()) error_ = "HSA layer " + std::to_string(layer) + ": " + error.what();
+        if (!encoder) std::fill_n(static_cast<float*>(dst->data), ggml_nelements(dst),
+                                 std::numeric_limits<float>::quiet_NaN());
     }
 }
 
-void RocketAdapter::compute_layer(ggml_tensor* dst, int layer) {
-    if (!active_ || !step_pending_ || layer != next_layer_) {
-        throw std::runtime_error("Unexpected HSA layer execution order");
+void RocketAdapter::compute_layer(ggml_tensor* dst, int layer, void* encoder) {
+    if (!active_ || !step_pending_ || stats_.calls_per_layer[layer] != stats_.layer_calls / int64_t(layers_.size())) {
+        throw std::runtime_error("Unexpected or duplicate HSA layer execution");
     }
-    if (layer == 0) refresh_slots();
+    if (next_layer_ == 0) refresh_slots();
     const int count = (int)slots_.size();
     const int dim = config_.dim_head;
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; !encoder && i < count; ++i) {
         if (tensor_value(dst->src[3], slots_[i]) != 0.0f) {
             throw std::runtime_error("Candidate is masked or uses unsupported attention bias");
         }
     }
     auto cfg = config_;
     if (full_attention_) cfg.topk_decode = count;
-    if (metal_) {
-        metal_->compute(dst->src[0], dst->src[1], dst->src[2], slots_, cfg, static_cast<float*>(dst->data));
+    if (encoder) {
+        metal_->encode(dst, slots_, cfg, encoder, layer);
+    } else if (metal_) {
+        const auto& state = layers_[layer];
+        metal_->compute(dst->src[0], state.k ? state.k : dst->src[1], state.v ? state.v : dst->src[2], slots_, cfg,
+                        static_cast<float*>(dst->data), nullptr, layer);
     } else {
         q_.resize((size_t)config_.num_heads * dim);
         k_.resize((size_t)config_.num_heads_kv * count * dim);

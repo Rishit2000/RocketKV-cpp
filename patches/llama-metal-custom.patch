@@ -1,0 +1,133 @@
+diff --git a/ggml/include/ggml-metal.h b/ggml/include/ggml-metal.h
+--- a/ggml/include/ggml-metal.h
++++ b/ggml/include/ggml-metal.h
+@@ -61,6 +61,12 @@
+ // The caller must synchronize producers and keep the tensor's backend buffer alive until GPU work completes.
+ typedef bool (*ggml_backend_metal_get_tensor_buffer_t)(const struct ggml_tensor * tensor, void ** buffer, size_t * offset);
+ 
++// Optional proc address: "ggml_backend_metal_set_custom". Keeps the CPU CUSTOM fallback.
++// Encode into the borrowed MTLComputeCommandEncoder; do not commit, wait, or throw.
++// Callbacks may run concurrently, before input producers finish. Declare all tensor dependencies in src[].
++typedef void (*ggml_backend_metal_custom_encode_t)(struct ggml_tensor * tensor, void * encoder, void * userdata);
++typedef bool (*ggml_backend_metal_set_custom_t)(struct ggml_tensor * tensor, ggml_backend_metal_custom_encode_t encode, void * userdata);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -1,11 +1,30 @@
+ #pragma once
+ 
+ #include "ggml.h"
++#include "ggml-metal.h"
++#include <string.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
++struct ggml_metal_custom_params {
++    uint64_t tag;
++    ggml_backend_metal_custom_encode_t encode;
++    void * userdata;
++};
++#define GGML_METAL_CUSTOM_TAG UINT64_C(0x524f434b4d544c31)
++#define GGML_METAL_CUSTOM_OFFSET (GGML_MAX_OP_PARAMS - sizeof(struct ggml_metal_custom_params))
++
++static inline struct ggml_metal_custom_params ggml_metal_get_custom(const struct ggml_tensor * tensor) {
++    struct ggml_metal_custom_params params = {0};
++    if (tensor->op == GGML_OP_CUSTOM) {
++        memcpy(&params, (const char *) tensor->op_params + GGML_METAL_CUSTOM_OFFSET, sizeof(params));
++        if (params.tag != GGML_METAL_CUSTOM_TAG) params.encode = NULL;
++    }
++    return params;
++}
++
+ struct ggml_metal_buffer_id {
+     void * metal; // id<MTLBuffer>
+     size_t offs;
+@@ -71,6 +90,8 @@
+ //
+ 
+ typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
++
++void * ggml_metal_encoder_get_obj(ggml_metal_encoder_t encoder);
+ 
+ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
+ void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -833,6 +833,10 @@
+     id<MTLComputeCommandEncoder> obj;
+ };
+ 
++void * ggml_metal_encoder_get_obj(ggml_metal_encoder_t encoder) {
++    return encoder->obj;
++}
++
+ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
+     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
+ 
+@@ -1554,6 +1558,8 @@
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_CUSTOM:
++            return ggml_metal_get_custom(op).encode != NULL;
+         case GGML_OP_SCALE:
+             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16);
+         case GGML_OP_FILL:
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -284,6 +284,14 @@
+     }
+ 
+     switch (node->op) {
++        case GGML_OP_CUSTOM:
++            {
++                const auto custom = ggml_metal_get_custom(node);
++                GGML_ASSERT(custom.encode);
++                ggml_metal_encoder_memory_barrier(ctx->enc);
++                custom.encode(node, ggml_metal_encoder_get_obj(ctx->enc), custom.userdata);
++                ggml_metal_encoder_memory_barrier(ctx->enc);
++            } break;
+         case GGML_OP_CONCAT:
+             {
+                 n_fuse = ggml_metal_op_concat(ctx, idx);
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -968,7 +968,18 @@
+     ggml_metal_fusion_info_set_enabled((struct ggml_metal_fusion_info *) finfo, enabled);
+ }
+ 
++static bool ggml_backend_metal_set_custom(ggml_tensor * tensor, ggml_backend_metal_custom_encode_t encode, void * userdata) {
++    static_assert(sizeof(ggml_custom_op_params) <= GGML_METAL_CUSTOM_OFFSET, "CUSTOM parameters overlap");
++    if (!tensor || tensor->op != GGML_OP_CUSTOM || !encode) return false;
++    const ggml_metal_custom_params params = {GGML_METAL_CUSTOM_TAG, encode, userdata};
++    memcpy((char *) tensor->op_params + GGML_METAL_CUSTOM_OFFSET, &params, sizeof(params));
++    return true;
++}
++
+ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_metal_set_custom") == 0) {
++        return (void *) ggml_backend_metal_set_custom;
++    }
+     if (strcmp(name, "ggml_backend_metal_get_tensor_buffer") == 0) {
+         return (void *) ggml_backend_metal_get_tensor_buffer;
+     }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2998,7 +2998,6 @@
+         }
+         cur = cparams.rocket_attention(ctx0, q, k, v, kq_mask, kq_scale, il, cparams.rocket_user_data);
+         GGML_ASSERT(cur && cur->type == GGML_TYPE_F32);
+-        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], 1);
+         ggml_build_forward_expand(gf, cur);
+         return cur;

@@ -33,7 +33,6 @@ build_stage2() (
     [[ $# -eq 0 ]] || fail "Usage: scripts/stage2.sh build"
     LLAMA="$ROOT/llama.cpp"
     REVISION="$(cat "$ROOT/patches/llama.cpp-revision")"
-    PATCH="$ROOT/patches/llama-stage2.patch"
     JOBS="${JOBS:-4}"
     [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || fail "JOBS must be positive."
 
@@ -49,12 +48,19 @@ build_stage2() (
     [[ "$(git -C "$LLAMA" rev-parse HEAD)" == "$REVISION" ]] ||
         fail "llama.cpp must be at $REVISION. Existing checkout was not changed."
 
-    if git -C "$LLAMA" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
-        echo "Rocket patch is already applied."
-    elif git -C "$LLAMA" apply --check "$PATCH"; then
-        git -C "$LLAMA" apply "$PATCH"
+    # The final patch extends both earlier patches, so check it first on rebuilds.
+    if git -C "$LLAMA" apply --reverse --check "$ROOT/patches/llama-metal-custom.patch" >/dev/null 2>&1; then
+        echo "Rocket Metal patches are already applied."
     else
-        fail "Rocket patch conflicts with the local llama.cpp checkout."
+        for PATCH in "$ROOT/patches/llama-stage2.patch" "$ROOT/patches/llama-metal-buffer.patch" "$ROOT/patches/llama-metal-custom.patch"; do
+            if git -C "$LLAMA" apply --reverse --check "$PATCH" >/dev/null 2>&1; then
+                echo "$(basename "$PATCH") is already applied."
+            elif git -C "$LLAMA" apply --check "$PATCH"; then
+                git -C "$LLAMA" apply "$PATCH"
+            else
+                fail "$(basename "$PATCH") conflicts with the local llama.cpp checkout."
+            fi
+        done
     fi
 
     if [[ "$(uname -s)" == "Darwin" ]]; then METAL="${METAL:-ON}"; else METAL="${METAL:-OFF}"; fi

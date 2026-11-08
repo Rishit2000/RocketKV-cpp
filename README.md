@@ -2,7 +2,7 @@
 
 C++17 implementation of **RocketKV** prefill eviction and hybrid sparse decode, integrated with a pinned, patched [`llama.cpp`](https://github.com/ggerganov/llama.cpp).
 
-> **Current status:** Stage 1 + Stage 2 supports CPU-reference and Metal HSA for single-sequence Llama models with F16 KV. The Metal backend executes candidate packing, approximate scoring, deterministic Top-K selection and exact sparse attention on GPU. Stage 1 eviction and KV position bookkeeping remain on CPU. Multi-turn inference is not supported.
+> **Current status:** Stage 1 + Stage 2 supports CPU-reference and Metal HSA for single-sequence Llama models with F16 KV. The Metal backend executes cached chunk summaries, approximate scoring, deterministic Top-K selection and exact sparse attention on GPU. Stage 1 eviction and KV position bookkeeping remain on CPU. Multi-turn inference is not supported.
 
 ---
 
@@ -37,8 +37,8 @@ RocketKV-cpp/
 | Component | Responsibility |
 |---|---|
 | `src/runner.cpp` | Select `off`, `stage1`, or `hsa`; hand over retained positions; manage request state and report actual forward/layer calls. |
-| `src/rocket_adapter.cpp`, `include/rocket_adapter.h` | Read each layer's real KV cache, map positions to live slots, pack tensors, and call the existing sparse attention algorithm from a GGML CPU node. |
-| `src/metal/`, `include/rocket_metal.h` | Metal HSA kernels and synchronous GPU dispatch. |
+| `src/rocket_adapter.cpp`, `include/rocket_adapter.h` | Map retained positions to live KV slots and dispatch sparse attention through GGML Metal or the CPU callback. |
+| `src/metal/`, `include/rocket_metal.h` | Metal HSA kernels and GGML GPU dispatch. |
 | `patches/llama-stage2.patch` | Add context-scoped hooks and KV-position access; replace decode attention inside the graph; prevent stale graph reuse after mode changes. |
 | `src/rocket.cpp`, `include/rocket.h` | Retain the algorithm structure while adding input checks, short-prompt/zero-query fixes, deterministic top-r ties, and optional selection output for tests. |
 
@@ -149,7 +149,9 @@ STAGE2_BACKEND=metal GPU_LAYERS=99 THREADS=16 BUDGET=1024 N_CTX=9216 CONTEXT_LEN
 ROCKET_TEST_METAL=1 bash scripts/stage2.sh test
 ```
 
-The Metal implementation is isolated in `src/metal/`; `src/rocket.cpp` remains the CPU reference. Kernels are embedded into the binary at build time, so execution does not depend on the working directory. The adapter keeps the existing GGML CPU callback as a synchronous dispatch boundary: the scheduler provides host-readable inputs, the Metal wrapper copies their raw bytes to reusable shared buffers, and GPU kernels pack candidates and compute attention. One command buffer completes per layer before returning its output. This first implementation still has staging and synchronization overhead; it is not a fully asynchronous GGML Metal operator.
+The Metal implementation is isolated in `src/metal/`; `src/rocket.cpp` remains the CPU reference. Kernels are embedded into the binary at build time. With compatible shared Metal buffers, HSA encodes into GGML's existing command encoder, reads Q/K/V and writes its output directly, and checks GPU errors after decode synchronization. Scratch buffers are isolated per layer; the scheduler tracks the complete tensor dependencies. CPU inputs and unsupported buffers retain synchronous staging, with direct K/V binding where available. `scripts/stage2.sh build` applies the optional buffer and custom-op bridges from `patches/`.
+
+GPU kernels read selected F16 K/V with F32 accumulation. Per-layer chunk min/max summaries reuse immutable KV prefixes and update the tail on append; request resets, changed slots or summary shapes rebuild them. Single-token chunks read K directly. Top-K sorting uses threadgroup memory when it fits, with the original device-memory path for larger candidate sets. Both paths preserve score/index tie-breaking and chronological accumulation order.
 
 Supported Metal shapes are head dimensions 1–256, up to 256 query heads per KV group, and 1–32,768 live candidates, with F32 Q and F16 K/V. Unsupported shapes and non-finite input/output fail explicitly. The shader uses F32 accumulation and deterministic score/index tie-breaking; floating-point reduction order can differ from the CPU reference, particularly near selection boundaries. Full-model quantized CPU/Metal math also differs. Tests compare selected indices and attention on controlled inputs, and layer outputs/logits in real-model integration tests.
 
@@ -169,7 +171,7 @@ The batch input is a JSON array, for example:
 [{"sample_id": 1, "prompt": "Once upon a time", "max_tokens": 32}]
 ```
 
-The built-in demonstration is a smoke test, not a LongBench/RULER accuracy evaluation. `test` covers algorithm boundaries, all-candidate attention/logit equivalence, sparse graph connectivity, state isolation, legacy modes, failure cases, and script dispatch. Both backends recompute chunk information each step; persistent summaries and asynchronous backend integration remain future work.
+The built-in demonstration is a smoke test, not a LongBench/RULER accuracy evaluation. `test` covers algorithm boundaries, all-candidate attention/logit equivalence, sparse graph connectivity, state isolation, legacy modes, failure cases, and script dispatch. The CPU reference recomputes chunk information each step; Metal caches it per layer and uses the scheduler's command encoder for compatible buffers.
 
 The test script uses UBSan by default. To also run ASan, set `SANITIZERS=address,undefined` and select a compatible compiler with `CXX`. On the development machine, Apple's ASan runtime deadlocked before `main()`; that run was stopped and is not reported as passing. Sanitizer runs have a timeout rather than hanging indefinitely.
 
