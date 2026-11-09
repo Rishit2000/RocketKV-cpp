@@ -1596,5 +1596,33 @@
       "process_wall_s": 12.362153124999992
     }
   ],
-  "status": "complete"
+  "status": "complete",
+  "historical_quality": {
+    "source": "results/longbench_stage2_20261108_163206/summary.json",
+    "source_sha256": "540f572e0c84ad583550c123e35a241341de4390615fcc05c8abe001a9e97839",
+    "commit": "8b9b27a4865c38862637034f7fcf7b68168f6bbb",
+    "context_limit": 8192,
+    "samples_per_task": 30,
+    "current_version_evaluated": false,
+    "metrics": {
+      "multi_news": "ROUGE-L",
+      "trec": "Classification",
+      "passage_retrieval_en": "Retrieval score",
+      "repobench-p": "Code similarity"
+    },
+    "scores": {
+      "off": {
+        "multi_news": 26.36800666195535,
+        "trec": 73.33333333333333,
+        "passage_retrieval_en": 72.22222222222223,
+        "repobench-p": 40.2
+      },
+      "hsa": {
+        "multi_news": 24.30892382522599,
+        "trec": 66.66666666666667,
+        "passage_retrieval_en": 72.22222222222223,
+        "repobench-p": 41.36666666666667
+      }
+    }
+  }
 }
