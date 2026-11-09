@@ -92,7 +92,6 @@ def render_pdf():
 
     d=json.loads(DATA.read_text())
     assert d.get('status')=='complete' and len(d['runs'])==24
-    q=d['historical_quality']
     lengths=d['config']['lengths']
     rows={(r['context'],r['variant']):r for r in d['runs']}
     def value(n,v,pipeline=False):
@@ -187,12 +186,12 @@ def render_pdf():
             'Model stays on GPU for CPU HSA. Pipeline excludes loading / tokenization / sampling. Each kernel card is a separate A/B. Sources: benchmark JSON + HSA_OPTIMIZATION_LOG.md.'])
     c.showPage()
 
-    header(2,'Final HSA vs native baseline','Latency: final Metal dbf4743. Quality: historical HSA 8b9b27a only; final-version task accuracy has not been measured.')
+    header(2,'Final HSA vs native baseline','Final Metal dbf4743 vs native full attention | 2K / 4K / 8K / 16K | Lower latency is better.')
     def barpanel(x,w,pipeline):
-        rect(x,288,w,214)
+        rect(x,112,w,390)
         text(x+14,483,'Pipeline latency (s)' if pipeline else 'Decode latency (ms / forward)',12,navy,True)
         legend(x+14,466,[('Native baseline',navy),('Final HSA',teal)],143)
-        l,r,b,t=x+37,x+w-14,333,446
+        l,r,b,t=x+37,x+w-14,169,446
         ymax=14 if pipeline else 25
         ticks=[0,5,10] if pipeline else [0,10,20]
         for tick in ticks:
@@ -205,38 +204,12 @@ def render_pdf():
                 text(xx+9,b+h+5,f'{v:.2f}',8,col,True,align='center')
             text(center,b-14,f'{n//1024}K',9,navy,align='center')
             text(center,b-29,f'{z/a:.2f}x',8.5,teal,True,align='center')
-        text(x+14,294,'Ratio below each group = final / baseline latency (>1 means slower).',7.5,gray)
+        text(x+14,124,'Ratio below each group = final / baseline latency (>1 means slower).',7.5,gray)
     barpanel(36,376,False);barpanel(430,376,True)
 
-    text(36,266,'QUALITY / TASK SCORES (0-100)',11,navy,True)
-    text(806,266,'30 samples per task | 120 total | context capped at 8K | higher is better',8,gray,align='right')
-    rect(36,72,541,183)
-    text(50,237,'Historical comparison - NOT final-version accuracy',10,orange,True)
-    legend(50,219,[('Native baseline',navy),('Historical HSA',orange)],161)
-    l,r,b,t=73,560,122,205
-    for tick in [0,40,80]:
-        y=b+tick/80*(t-b);line(l,y,r,y);text(l-8,y-3,tick,7.5,gray,align='right')
-    tasks=['multi_news','trec','passage_retrieval_en','repobench-p']
-    labels=[('Multi-News','ROUGE-L'),('TREC','Classification'),('Retrieval','Retrieval score'),('RepoBench-P','Code similarity')]
-    for j,(task,(label,metric)) in enumerate(zip(tasks,labels)):
-        center=l+(j+.5)*(r-l)/4
-        a,z=q['scores']['off'][task],q['scores']['hsa'][task]
-        for xx,v,col in [(center-23,a,navy),(center+3,z,orange)]:
-            h=v/80*(t-b);rect(xx,b,21,h,col,r=0)
-            text(xx+10.5,b+h+5,f'{v:.2f}',8,col,True,align='center')
-        text(center,b-15,label,8.5,navy,True,align='center')
-        text(center,b-27,metric,7.5,gray,align='center')
-        text(center,b-40,f'{z-a:+.2f} points',8,orange,align='center')
-    rect(595,72,211,183,fill='#FFF5E9')
-    text(609,235,'FINAL-VERSION ACCURACY',10,orange,True)
-    text(609,211,'Not yet measured',17,navy,True)
-    line(609,197,791,197,'#E5CEAB')
-    text(609,180,'Existing numerical check',10,navy,True)
-    lines(609,164,['8K / 16K / 32K, 4 fixed forwards:','attention + logits match the','pre-optimization Metal version.'],9,14)
-    text(609,108,'Numerical parity is not task accuracy.',8.5,orange,True)
-    text(36,53,'Result: GPU migration accelerates HSA, but final HSA still has higher latency than native full attention.',10,navy,True)
-    footer(['Latency and quality use different workloads and versions; they are not a paired accuracy-latency trade-off experiment. No new quality evaluation was run.',
-            'Sources: docs/hsa_pipeline_benchmark.json (latency + attributed historical scores); HSA_OPTIMIZATION_LOG.md (kernel A/B and parity).'])
+    text(36,75,'Result: GPU migration accelerates HSA, but final HSA still has higher latency than native full attention.',10,navy,True)
+    footer(['Latency: one run per configuration, identical forced tokens, 32 decode forwards. Pipeline = prefill + Stage 1 + initialization + decode.',
+            'Pipeline excludes model loading, tokenization and sampling. Sources: docs/hsa_pipeline_benchmark.json; HSA_OPTIMIZATION_LOG.md.'])
     c.save()
     print(out)
 
