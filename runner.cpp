@@ -27,15 +27,16 @@ struct DecodeHold {
     ggml_backend_t backend = nullptr;
     ggml_tensor *q = nullptr;
     ggml_tensor *k = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
     bool enabled = false;
-}
+};
 
 static DecodeHold g_dec;
 
 
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
-    if (!g_acts.enabled) return false;
+    if (!g_acts.enabled && !g_dec.enabled) return false;
 
     const char * name = t->name;
     if (!name) return false;
@@ -59,20 +60,12 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (n_tokens_ubatch <= 1) {
         if (!g_dec.enabled) return true;
-        // decode stage with single-token query
-        ggml_backend_t backend = ggml_backend_buffer_get_backend(t->buffer);
-        if (!g_dec.ctx) {
-            ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
-            g_dec.ctx = ggml_init(ip);
-            g_dec.backend = backend;
+        // decode stage with single-token tensor
+        if (!g_dec.buf) {
+            g_dec.backend = ggml_backend_buffer_get_backend(t->buffer);
+            g_dec.buf = ggml_backend_alloc_ctx_tensors(g_dec.ctx, g_dec.backend);
         }
-        // place the query or key tensor into the right slot 
-        ggml_tensor ** slot = is_q ? &g_dec.q : &g_dec.k;
-        if (!*slot) {
-            *slot = ggml_dup_tensor(g_dec.ctx, t);
-            ggml_backend_alloc_ctx_tensors(g_dec.ctx, backend);
-        }
-        ggml_backend_tensor_copy(t, *slot);
+        ggml_backend_tensor_copy(t, is_q ? g_dec.q: g_dec.k);
         return true;
     }
 
@@ -317,6 +310,12 @@ static InferenceOutput run_inference(
     // Sample the initial token generated from the prefill prompt
     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
+    ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
+    g_dec.ctx = ggml_init(ip);
+    // define the shape of the tensor stored in q, but not the actual data
+    g_dec.q = ggml_new_tensor_3d(g_dec.ctx, GGML_TYPE_F32, config.dim_head, config.num_heads, 1);
+    g_dec.k = ggml_new_tensor_3d(g_dec.ctx, GGML_TYPE_F32, config.dim_head, config.num_heads_kv, 1);
+
     int64_t t_start_decode = ggml_time_us();
 
     while (n_cur < ctx_params.n_ctx && n_decode_steps < max_tokens) {
@@ -341,8 +340,10 @@ static InferenceOutput run_inference(
         batch_decode.logits[0] = true;
         batch_decode.n_tokens = 1;
 
+        g_dec.enabled = enable_rocket;
         if (llama_decode(ctx, batch_decode) != 0) break;
         llama_synchronize(ctx);
+        g_dec.enabled = false;
 
         n_cur++;
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
