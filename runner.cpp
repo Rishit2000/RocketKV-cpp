@@ -57,31 +57,24 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     int n_heads = t->ne[1];
     int n_tokens_ubatch = t->ne[2];
 
-    
-
     if (n_tokens_ubatch <= 1) {
         if (!g_dec.enabled) return true;
         // decode stage with single-token query
         ggml_backend_t backend = ggml_backend_buffer_get_backend(t->buffer);
         if (!g_dec.ctx) {
-            // if no context provided, we assume t represents Q tensor
             ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
             g_dec.ctx = ggml_init(ip);
             g_dec.backend = backend;
-            g_dec.q = ggml_dup_tensor(g_dec.ctx, t);
+        }
+        // place the query or key tensor into the right slot 
+        ggml_tensor ** slot = is_q ? &g_dec.q : &g_dec.k;
+        if (!*slot) {
+            *slot = ggml_dup_tensor(g_dec.ctx, t);
             ggml_backend_alloc_ctx_tensors(g_dec.ctx, backend);
         }
-        ggml_tensor *dst = is_q ? g_dec.q : g_dec.k;
-        if (!dst) {
-            dst = ggml_dup_tensor(g_dec.ctx, t);
-            ggml_backend_alloc_ctx_tensors(g_dec.ctx, backend);
-            (is_q ? g_dec.q : g_dec.k) = dst;
-        }
-        ggml_backend_tensor_copy(t, dst);
+        ggml_backend_tensor_copy(t, *slot);
         return true;
     }
-
-    if (n_tokens_ubatch <= 1) return true; // Prefill only
 
     int total_tokens = g_acts.total_prompt_tokens;
     int n_elem = ggml_nelements(t);
