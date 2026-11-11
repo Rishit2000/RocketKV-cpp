@@ -132,7 +132,27 @@ std::vector<int> compute_prefill_eviction(
                 std::vector<float> logits(non_obs_k, -FLT_MAX);
 
                 // Causal dot product up to the non-observation boundary
-                for (int k_idx = 0; k_idx < non_obs_k; ++k_idx) {
+                int k_idx = 0;
+                // Interleave independent dots without reordering each dot's accumulation.
+                for (; k_idx + 3 < non_obs_k; k_idx += 4) {
+                    const float* k_ptr = K + (h_kv * len_k + k_idx) * cfg.dim_head;
+                    float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
+                    for (int d = 0; d < cfg.dim_head; ++d) {
+                        const float q = q_ptr[d];
+                        dot0 += q * k_ptr[d];
+                        dot1 += q * k_ptr[cfg.dim_head + d];
+                        dot2 += q * k_ptr[2 * cfg.dim_head + d];
+                        dot3 += q * k_ptr[3 * cfg.dim_head + d];
+                    }
+                    logits[k_idx] = dot0 * inv_sqrt_d;
+                    logits[k_idx + 1] = dot1 * inv_sqrt_d;
+                    logits[k_idx + 2] = dot2 * inv_sqrt_d;
+                    logits[k_idx + 3] = dot3 * inv_sqrt_d;
+                    for (int i = 0; i < 4; ++i) {
+                        if (logits[k_idx + i] > max_logit) max_logit = logits[k_idx + i];
+                    }
+                }
+                for (; k_idx < non_obs_k; ++k_idx) {
                     float dot = 0.0f;
                     const float* k_ptr = K + (h_kv * len_k + k_idx) * cfg.dim_head;
                     for (int d = 0; d < cfg.dim_head; ++d) {

@@ -149,6 +149,33 @@ static void test_sparse_contract() {
     std::cout << "  GQA selection, tail chunk, dense equivalence, zero queries, and invalid inputs: PASS\n";
 }
 
+static void test_prefill_key_tails() {
+    for (int dim : {1, 7, 128}) {
+        for (int prefix : {1, 2, 3, 4, 5, 7, 8, 9, 17}) {
+            RocketConfig cfg{};
+            cfg.num_heads = 4;
+            cfg.num_heads_kv = 2;
+            cfg.dim_head = dim;
+            cfg.window_size = 3;
+            cfg.kernel_size = 1;
+            cfg.prompt_budget = 4;
+            const int count = prefix + cfg.window_size;
+            std::vector<float> q(cfg.num_heads * count * dim, 0.1f);
+            std::vector<float> k(cfg.num_heads_kv * count * dim);
+            for (int h = 0; h < cfg.num_heads_kv; ++h) {
+                for (int t = 0; t < count; ++t) {
+                    for (int d = 0; d < dim; ++d) {
+                        k[(h * count + t) * dim + d] = 0.03f * (t + 1) + 0.001f * d;
+                    }
+                }
+            }
+            const auto kept = compute_prefill_eviction(q.data(), k.data(), count, count, cfg);
+            assert((kept == std::vector<int>{prefix - 1, prefix, prefix + 1, prefix + 2}));
+        }
+    }
+    std::cout << "  Prefill grouped-key tails and non-vector-width dimensions: PASS\n";
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "RocketKV C++ Algorithmic Verification" << std::endl;
@@ -307,6 +334,7 @@ int main() {
 
     std::cout << "\n[Test 4] Deterministic Sparse Attention Contract..." << std::endl;
     test_sparse_contract();
+    test_prefill_key_tails();
 
     std::cout << "\n========================================" << std::endl;
     std::cout << "All Algorithmic Verification Tests Passed!" << std::endl;
