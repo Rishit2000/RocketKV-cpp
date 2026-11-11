@@ -331,6 +331,8 @@ int main() {
         compare(metal, 96, 129, 2, 23);
         compare(metal, 256, 17, 2, 5);
         compare(metal, 16, 32768, 3, 17, true);
+        compare(metal, 16, 8193, 1, 511);
+        compare(metal, 17, 8193, 1, 8192, true);
         compare(metal, 64, 257, 3, 17, false, false, 1e-6f);
         compare_cache(metal);
         if (backend) compare_cache(metal, backend.get());

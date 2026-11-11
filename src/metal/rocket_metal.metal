@@ -2,9 +2,9 @@
 using namespace metal;
 
 struct Params {
-    uint dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded, topk_padded;
+    uint dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded;
     uint qd, qh, kd, kt, kh, vd, vt, vh;
-    uint cached_count, mask_type, mask_stride, sort_padded, bounds_stride;
+    uint cached_count, mask_type, mask_stride, bounds_stride;
 };
 #define ARGS                                                                                                 \
     constant Params &p [[buffer(0)]], device const uchar *qr [[buffer(1)]],                                  \
@@ -176,9 +176,20 @@ kernel void softmax(ARGS, constant uint &width [[buffer(16)]], constant uint &ex
     }
 }
 
-template <typename Scores, typename Indices>
+inline uint selection_prefix(uint value, threadgroup uint *scratch, uint tid, uint width) {
+    uint prefix = simd_prefix_exclusive_sum(value);
+    uint group = tid / width;
+    if (tid % width == width - 1) scratch[group] = prefix + value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = 0; i < group; ++i) prefix += scratch[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return prefix;
+}
+
+template <typename Scores>
 inline void select_tokens_impl(constant Params &p, device const float *chunks, device uint *indices,
-                               Scores values, Indices ids, uint tid, uint group, uint width, mem_flags memory) {
+                               Scores values, threadgroup atomic_uint *histogram, threadgroup uint *scratch,
+                               device atomic_uint *error, uint tid, uint group, uint width, mem_flags memory) {
     if (p.topk == p.count) {
         for (uint i = tid; i < p.count; i += 256) {
             indices[group * p.padded + i] = i;
@@ -186,95 +197,97 @@ inline void select_tokens_impl(constant Params &p, device const float *chunks, d
         return;
     }
     uint nh = p.heads / p.kv_heads;
-    for (uint i = tid; i < p.sort_padded; i += 256) {
+    for (uint i = tid; i < p.chunks; i += 256) {
         float score = 0;
-        if (i < p.chunks) {
-            for (uint h = 0; h < nh; ++h) {
-                score += chunks[(group * nh + h) * p.chunks + i];
-            }
+        for (uint h = 0; h < nh; ++h) {
+            score += chunks[(group * nh + h) * p.chunks + i];
         }
-        values[i] = i < p.chunks ? score : -INFINITY;
-        ids[i] = i;
+        if (!isfinite(score) || score < 0) atomic_store_explicit(error, 1u, memory_order_relaxed);
+        values[i] = score;
     }
     threadgroup_barrier(memory);
-    // One threadgroup owns each KV group's sort; no cross-threadgroup barrier is needed.
-    for (uint size = 2; size <= p.sort_padded; size *= 2) {
-        for (uint stride = size / 2; stride; stride /= 2) {
-            for (uint i = tid; i < p.sort_padded; i += 256) {
-                uint j = i ^ stride;
-                if (stride < width) {
-                    float value = values[i], other = simd_shuffle_xor(value, stride);
-                    uint id = ids[i], other_id = simd_shuffle_xor(id, stride);
-                    bool descending = ((i & size) == 0) == ((i & stride) == 0);
-                    if (descending ? better(other, other_id, value, id) : better(value, id, other, other_id)) {
-                        values[i] = other;
-                        ids[i] = other_id;
-                    }
-                } else if (j > i) {
-                    bool swap = (i & size) == 0 ? better(values[j], ids[j], values[i], ids[i])
-                                                : better(values[i], ids[i], values[j], ids[j]);
-                    if (swap) {
-                        float f = values[i];
-                        values[i] = values[j];
-                        values[j] = f;
-                        uint u = ids[i];
-                        ids[i] = ids[j];
-                        ids[j] = u;
-                    }
-                }
-            }
-            if (stride >= width || stride == 1) threadgroup_barrier(memory);
-        }
-    }
-    // Tokens within a chunk share a score. Expand ranked chunks, accounting for the short tail.
-    const uint missing = p.chunks * p.chunk - p.count;
-    if (!missing) {
-        if (tid == 0) values[0] = float(p.count);
-    } else {
+
+    // Nonnegative F32 scores have the same ordering as their unsigned bit patterns.
+    // Weight each chunk by its token count so the short tail cannot change top-k.
+    uint cutoff = 0, mask = 0;
+    if (tid == 0) scratch[0] = p.topk;
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        if (tid < 16) atomic_store_explicit(histogram + tid, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint local[16] = {};
         for (uint i = tid; i < p.chunks; i += 256) {
-            if (ids[i] == p.chunks - 1) values[0] = float(i * p.chunk);
+            uint key = as_type<uint>(values[i]);
+            if ((key & mask) == cutoff) {
+                local[(key >> shift) & 15u] += min(p.chunk, p.count - i * p.chunk);
+            }
         }
-    }
-    threadgroup_barrier(memory);
-    uint tail_start = uint(values[0]);
-    threadgroup_barrier(memory);
-    for (uint i = tid; i < p.topk_padded; i += 256) {
-        uint j = i + (i >= tail_start + p.chunk - missing ? missing : 0);
-        values[i] = i < p.topk ? float(ids[j / p.chunk] * p.chunk + j % p.chunk) : INFINITY;
-    }
-    threadgroup_barrier(memory);
-    // Candidate IDs <=32768 are exact in F32; reuse scores to sort IDs chronologically.
-    for (uint size = 2; size <= p.topk_padded; size *= 2) {
-        for (uint stride = size / 2; stride; stride /= 2) {
-            for (uint i = tid; i < p.topk_padded; i += 256) {
-                uint j = i ^ stride;
-                if (stride < width) {
-                    float value = values[i], other = simd_shuffle_xor(value, stride);
-                    bool ascending = ((i & size) == 0) == ((i & stride) == 0);
-                    values[i] = ascending ? min(value, other) : max(value, other);
-                } else if (j > i && ((i & size) == 0 ? values[i] > values[j] : values[i] < values[j])) {
-                    float value = values[i];
-                    values[i] = values[j];
-                    values[j] = value;
+        for (uint bin = 0; bin < 16; ++bin) {
+            if (local[bin]) atomic_fetch_add_explicit(histogram + bin, local[bin], memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint rank = scratch[0];
+            for (int bin = 15; bin >= 0; --bin) {
+                uint count = atomic_load_explicit(histogram + bin, memory_order_relaxed);
+                if (rank > count) {
+                    rank -= count;
+                } else {
+                    scratch[0] = rank;
+                    scratch[1] = cutoff | (uint(bin) << shift);
+                    break;
                 }
             }
-            if (stride >= width || stride == 1) threadgroup_barrier(memory);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cutoff = scratch[1];
+        mask |= 15u << shift;
+    }
+    uint rank = scratch[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Contiguous chunk ranges plus integer prefix sums emit chronological IDs directly.
+    uint block = (p.chunks + 255) / 256;
+    uint begin = min(tid * block, p.chunks), end = min(begin + block, p.chunks);
+    uint tied = 0;
+    for (uint i = begin; i < end; ++i) {
+        if (as_type<uint>(values[i]) == cutoff) tied += min(p.chunk, p.count - i * p.chunk);
+    }
+    uint tie_prefix = selection_prefix(tied, scratch, tid, width);
+    uint selected = 0, remaining = rank > tie_prefix ? rank - tie_prefix : 0;
+    for (uint i = begin; i < end; ++i) {
+        uint key = as_type<uint>(values[i]), weight = min(p.chunk, p.count - i * p.chunk);
+        if (key > cutoff) selected += weight;
+        if (key == cutoff) {
+            uint take = min(remaining, weight);
+            selected += take;
+            remaining -= take;
         }
     }
-    for (uint i = tid; i < p.topk; i += 256) indices[group * p.padded + i] = uint(values[i]);
+    uint output = selection_prefix(selected, scratch, tid, width);
+    remaining = rank > tie_prefix ? rank - tie_prefix : 0;
+    for (uint i = begin; i < end; ++i) {
+        uint key = as_type<uint>(values[i]), weight = min(p.chunk, p.count - i * p.chunk);
+        uint take = key > cutoff ? weight : key == cutoff ? min(remaining, weight) : 0;
+        if (key == cutoff) remaining -= take;
+        for (uint j = 0; j < take; ++j) indices[group * p.padded + output++] = i * p.chunk + j;
+    }
 }
 
 kernel void select_tokens(ARGS, uint tid [[thread_index_in_threadgroup]],
                           uint group [[threadgroup_position_in_grid]], uint width [[threads_per_simdgroup]]) {
-    select_tokens_impl(p, chunks, indices, scores + group * p.padded, indices + group * p.padded,
-                       tid, group, width, mem_flags::mem_device);
+    threadgroup atomic_uint histogram[16];
+    threadgroup uint scratch[256];
+    select_tokens_impl(p, chunks, indices, scores + group * p.padded, histogram, scratch,
+                       error, tid, group, width, mem_flags::mem_device);
 }
 
 kernel void select_tokens_local(ARGS, threadgroup float *values [[threadgroup(0)]],
-                               threadgroup uint *ids [[threadgroup(1)]],
                                uint tid [[thread_index_in_threadgroup]],
                                uint group [[threadgroup_position_in_grid]], uint width [[threads_per_simdgroup]]) {
-    select_tokens_impl(p, chunks, indices, values, ids, tid, group, width, mem_flags::mem_threadgroup);
+    threadgroup atomic_uint histogram[16];
+    threadgroup uint scratch[256];
+    select_tokens_impl(p, chunks, indices, values, histogram, scratch,
+                       error, tid, group, width, mem_flags::mem_threadgroup);
 }
 
 kernel void exact_scores(ARGS, uint i [[thread_position_in_grid]]) {

@@ -32,9 +32,9 @@ enum Buffer {
 };
 enum Pipeline { Pack, Summarize, Prepare, Approximate, Softmax, Select, SelectLocal, Exact, WeightedSum, PipelineCount };
 struct Params {
-    uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded, topk_padded;
+    uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded;
     uint32_t qd, qh, kd, kt, kh, vd, vt, vh;
-    uint32_t cached_count, mask_type, mask_stride, sort_padded, bounds_stride;
+    uint32_t cached_count, mask_type, mask_stride, bounds_stride;
 };
 uint32_t power_of_two(uint32_t n) {
     uint32_t p = 1;
@@ -209,9 +209,7 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         p.chunks = 1 + (p.count - 1) / p.chunk;
         p.padded = power_of_two(p.count);
         p.dim_padded = power_of_two(p.dim);
-        p.topk_padded = power_of_two(p.topk);
-        p.sort_padded = power_of_two(p.chunks);
-        p.bounds_stride = p.chunk > 1 ? p.sort_padded : 0;
+        p.bounds_stride = p.chunk > 1 ? power_of_two(p.chunks) : 0;
         p.qd = stride(q->nb[0]);
         p.qh = stride(q->nb[2]);
         p.kd = stride(k->nb[0]);
@@ -322,13 +320,11 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
             dispatch(Approximate, (p.heads * p.chunks + 255) / 256);
             softmax(p.chunks, 0);
         }
-        const size_t sort_bytes = std::max(size_t(16), size_t(std::max(p.sort_padded, p.topk_padded)) * sizeof(uint32_t));
-        if (p.topk < p.count && 2 * sort_bytes + m.pipelines[SelectLocal].staticThreadgroupMemoryLength <= m.device.maxThreadgroupMemoryLength) {
-            [encoder setThreadgroupMemoryLength:sort_bytes atIndex:0];
-            [encoder setThreadgroupMemoryLength:sort_bytes atIndex:1];
+        const size_t selection_bytes = ((size_t(p.chunks) + 3) / 4) * 16;
+        if (p.topk < p.count && selection_bytes + m.pipelines[SelectLocal].staticThreadgroupMemoryLength <= m.device.maxThreadgroupMemoryLength) {
+            [encoder setThreadgroupMemoryLength:selection_bytes atIndex:0];
             dispatch(SelectLocal, p.kv_heads);
             [encoder setThreadgroupMemoryLength:0 atIndex:0];
-            [encoder setThreadgroupMemoryLength:0 atIndex:1];
         } else {
             dispatch(Select, p.kv_heads);
         }
