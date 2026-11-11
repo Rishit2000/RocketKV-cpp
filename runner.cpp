@@ -28,7 +28,7 @@ struct DecodeHold {
     ggml_tensor *q = nullptr;
     ggml_tensor *k = nullptr;
     ggml_backend_buffer_t q_buf = nullptr;
-    ggml_backend_buffer_t t_buf = nullptr;
+    ggml_backend_buffer_t k_buf = nullptr;
     bool enabled = false;
 };
 
@@ -76,10 +76,10 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
             size_t n_bytes = ggml_nbytes(*slot);
             size_t align = ggml_backend_get_alignment(g_dec.backend);
             size_t bytes = ((n_bytes + align - 1) / align) * align;
-            *slot_buf = ggml_backend_alloc_buffer(
+            *slot_buf = ggml_backend_buft_alloc_buffer(
                 ggml_backend_get_default_buffer_type(g_dec.backend),
                 bytes);
-            ggml_backend_tensor_alloc(*slot_buf, *slot, nullptr);
+            ggml_backend_tensor_alloc(*slot_buf, *slot, nullptr, ggml_backend_buffer_get_base(*slot_buf));
         }
         ggml_backend_tensor_copy(t, *slot);
         return true;
