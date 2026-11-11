@@ -34,7 +34,7 @@ enum Pipeline { Pack, Summarize, Prepare, Approximate, Softmax, Select, SelectLo
 struct Params {
     uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded, topk_padded;
     uint32_t qd, qh, kd, kt, kh, vd, vt, vh;
-    uint32_t cached_count, mask_type, mask_stride, sort_padded;
+    uint32_t cached_count, mask_type, mask_stride, sort_padded, bounds_stride;
 };
 uint32_t power_of_two(uint32_t n) {
     uint32_t p = 1;
@@ -63,7 +63,7 @@ struct RocketMetal::Impl {
         id<MTLBuffer> bounds = nil;
         std::array<id<MTLBuffer>, BufferCount> buffers{};
         std::vector<int> slots;
-        uint32_t dim = 0, kv_heads = 0, chunk = 0;
+        uint32_t dim = 0, kv_heads = 0, chunk = 0, bounds_stride = 0;
     };
     std::vector<Cache> caches;
     Cache scratch;
@@ -211,6 +211,7 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         p.dim_padded = power_of_two(p.dim);
         p.topk_padded = power_of_two(p.topk);
         p.sort_padded = power_of_two(p.chunks);
+        p.bounds_stride = p.chunk > 1 ? p.sort_padded : 0;
         p.qd = stride(q->nb[0]);
         p.qh = stride(q->nb[2]);
         p.kd = stride(k->nb[0]);
@@ -227,9 +228,10 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         if (layer >= 0 && size_t(layer) >= m.caches.size()) m.caches.resize(size_t(layer) + 1);
         auto &cache = layer >= 0 ? m.caches[layer] : m.scratch;
         const size_t bounds_bytes = p.topk < p.count && p.chunk > 1
-                                        ? size_t(p.chunks) * p.kv_heads * p.dim * 2 * sizeof(ggml_fp16_t)
+                                        ? size_t(p.bounds_stride) * p.kv_heads * p.dim * 2 * sizeof(ggml_fp16_t)
                                         : 2 * sizeof(ggml_fp16_t);
         if (layer >= 0 && cache.dim == p.dim && cache.kv_heads == p.kv_heads && cache.chunk == p.chunk &&
+            cache.bounds_stride == p.bounds_stride &&
             cache.bounds.length >= bounds_bytes && cache.slots.size() < slots.size() &&
             std::equal(cache.slots.begin(), cache.slots.end(), slots.begin())) {
             p.cached_count = uint32_t(cache.slots.size());
@@ -349,6 +351,7 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
             cache.dim = p.dim;
             cache.kv_heads = p.kv_heads;
             cache.chunk = p.chunk;
+            cache.bounds_stride = p.bounds_stride;
         }
         if (output) std::memcpy(output, buffers[Output].contents, qbytes);
         if (selected) {

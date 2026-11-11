@@ -4,7 +4,7 @@ using namespace metal;
 struct Params {
     uint dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded, topk_padded;
     uint qd, qh, kd, kt, kh, vd, vt, vh;
-    uint cached_count, mask_type, mask_stride, sort_padded;
+    uint cached_count, mask_type, mask_stride, sort_padded, bounds_stride;
 };
 #define ARGS                                                                                                 \
     constant Params &p [[buffer(0)]], device const uchar *qr [[buffer(1)]],                                  \
@@ -56,8 +56,8 @@ kernel void summarize(ARGS, uint i [[thread_position_in_grid]]) {
         lo = min(lo, x);
         hi = max(hi, x);
     }
-    // Chunk-major layout keeps completed chunks stable as candidates grow.
-    bounds[(c * p.kv_heads + h) * p.dim + d] = half2(lo, hi);
+    // Adjacent scoring lanes read adjacent chunks; a fixed stride preserves cached prefixes.
+    bounds[(h * p.dim + d) * p.bounds_stride + c] = half2(lo, hi);
 }
 
 inline bool better(float a, uint ai, float b, uint bi) {
@@ -129,7 +129,7 @@ kernel void approximate(ARGS, uint i [[thread_position_in_grid]]) {
         if (p.chunk == 1) {
             rep = read_kv(kr, group, uint(slots[c]), d, p.kh, p.kt, p.kd);
         } else {
-            float2 extrema = float2(bounds[(c * p.kv_heads + group) * p.dim + d]);
+            float2 extrema = float2(bounds[(group * p.dim + d) * p.bounds_stride + c]);
             rep = positive ? extrema.y : extrema.x;
         }
         dot += q[h * p.dim + d] * rep;
