@@ -27,7 +27,8 @@ struct DecodeHold {
     ggml_backend_t backend = nullptr;
     ggml_tensor *q = nullptr;
     ggml_tensor *k = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
+    ggml_backend_buffer_t q_buf = nullptr;
+    ggml_backend_buffer_t t_buf = nullptr;
     bool enabled = false;
 };
 
@@ -61,11 +62,26 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (n_tokens_ubatch <= 1) {
         if (!g_dec.enabled) return true;
         // decode stage with single-token tensor
-        if (!g_dec.buf) {
+
+        if (!g_dec.ctx) {
+            ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
+            g_dec.ctx = ggml_init(ip);
             g_dec.backend = ggml_backend_buffer_get_backend(t->buffer);
-            g_dec.buf = ggml_backend_alloc_ctx_tensors(g_dec.ctx, g_dec.backend);
         }
-        ggml_backend_tensor_copy(t, is_q ? g_dec.q: g_dec.k);
+
+        ggml_tensor ** slot = is_q ? &g_dec.q : &g_dec.k;
+        ggml_backend_buffer_t * slot_buf = is_q ? &g_dec.q_buf : &g_dec.k_buf;
+        if (!*slot) {
+            *slot = ggml_new_tensor_3d(g_dec.ctx, t->type, t->ne[0], t->ne[1], t->ne[2]);
+            size_t n_bytes = ggml_nbytes(*slot);
+            size_t align = ggml_backend_get_alignment(g_dec.backend);
+            size_t bytes = ((n_bytes + align - 1) / align) * align;
+            *slot_buf = ggml_backend_alloc_buffer(
+                ggml_backend_get_default_buffer_type(g_dec.backend),
+                bytes);
+            ggml_backend_tensor_alloc(*slot_buf, *slot, nullptr);
+        }
+        ggml_backend_tensor_copy(t, *slot);
         return true;
     }
 
@@ -309,12 +325,6 @@ static InferenceOutput run_inference(
 
     // Sample the initial token generated from the prefill prompt
     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
-
-    ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
-    g_dec.ctx = ggml_init(ip);
-    // define the shape of the tensor stored in q, but not the actual data
-    g_dec.q = ggml_new_tensor_3d(g_dec.ctx, GGML_TYPE_F32, config.dim_head, config.num_heads, 1);
-    g_dec.k = ggml_new_tensor_3d(g_dec.ctx, GGML_TYPE_F32, config.dim_head, config.num_heads_kv, 1);
 
     int64_t t_start_decode = ggml_time_us();
 
