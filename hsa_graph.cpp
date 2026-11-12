@@ -44,11 +44,13 @@ void run_hsa_head_dim_graph(
                 ggml_repeat(gctx, one, stepped));
         struct ggml_tensor * sign = perm_cont(gctx, sign_hd, 1, 0, 2, 3);
 
+        // Qs is a (D, H, Hkv, 1) tensor
         struct ggml_tensor * Qs = ggml_mul(gctx, Q, sign);
         struct ggml_tensor * Ks = ggml_mul(gctx, K, sign);
 
         // reduce mean of absolute values of Q over group dimension
         struct ggml_tensor * abs_q = ggml_abs(gctx, Q);
+        // scores is dim (D, 1, Hkv, 1) tensor now
         struct ggml_tensor * scores = perm_cont(gctx, 
             ggml_mean(gcctx, perm_cont(gctx, abs_q, 1, 0, 2, 3)), 1, 0, 2, 3);
         struct ggml_tensor * idx = ggml_top_k(gctx, scores, r);
@@ -56,7 +58,11 @@ void run_hsa_head_dim_graph(
         struct ggml_tensor * q_hat = perm_cont(gctx, 
             ggml_get_rows(gctx, perm_cont(gctx, Qs, 1, 0, 2, 3), idx), 1, 0, 2, 3);
         struct ggml_tensor * k_hat = perm_cont(gctx,
-            ggml_get_rows(gctx, perm_cont(gctx,Ks, 1, 0, 2, 3), idx), 1, 0, 2, 3);
+            ggml_get_rows(gctx, perm_cont(gctx, Ks, 1, 0, 2, 3), idx), 1, 0, 2, 3);
+        struct ggml_tensor * sub_abs_all = ggml_sum_rows(gctx, abs_q);
+        struct ggml_tensor * sum_abs_kept = ggml_sum_rows(gctx, ggml_abs(gctx, q_hat));
+
+        
 
 
 
