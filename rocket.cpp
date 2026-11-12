@@ -199,6 +199,7 @@ std::vector<float> compute_hybrid_sparse_decode(
         std::vector<float> group_q_sum(cfg.dim_head, 0.0f);
         std::vector<float> sum_abs_all(heads_per_kv, 0.0f);
 
+        // for each query head in the group, compute the sum over all of its entries
         for (int d = 0; d < cfg.dim_head; ++d) {
             float sum_abs_d = 0.0f;
             float sum_val_d = 0.0f;
@@ -216,7 +217,8 @@ std::vector<float> compute_hybrid_sparse_decode(
         // Determine group consensus sign for key fetching
         std::vector<float> sign(cfg.dim_head);
         for (int d = 0; d < cfg.dim_head; ++d) {
-            sign[d] = (group_q_sum[d] >= 0.0f) ? 1.0f : -1.0f;
+            //note(keshav): to be consistent with the pytorch impl: set sign[d] = -1 if sum over query heads = 0
+            sign[d] = (group_q_sum[d] > 0.0f) ? 1.0f : -1.0f;
         }
 
         // Top-r dimension selection agreed upon by all query heads in the group
