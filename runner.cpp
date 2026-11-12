@@ -353,6 +353,7 @@ static InferenceOutput run_inference(
         g_dec.enabled = enable_rocket;
         if (llama_decode(ctx, batch_decode) != 0) break;
         llama_synchronize(ctx);
+        run_hsa_head_dim_graph(g_dec.backend, g_dec.q, g_dec.k, config);
         g_dec.enabled = false;
 
         n_cur++;

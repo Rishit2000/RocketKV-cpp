@@ -55,16 +55,27 @@ void run_hsa_head_dim_graph(
             ggml_mean(gcctx, perm_cont(gctx, abs_q, 1, 0, 2, 3)), 1, 0, 2, 3);
         struct ggml_tensor * idx = ggml_top_k(gctx, scores, r);
 
+        // pick out the top-r entries of q by mean absolute value
         struct ggml_tensor * q_hat = perm_cont(gctx, 
             ggml_get_rows(gctx, perm_cont(gctx, Qs, 1, 0, 2, 3), idx), 1, 0, 2, 3);
         struct ggml_tensor * k_hat = perm_cont(gctx,
             ggml_get_rows(gctx, perm_cont(gctx, Ks, 1, 0, 2, 3), idx), 1, 0, 2, 3);
         struct ggml_tensor * sub_abs_all = ggml_sum_rows(gctx, abs_q);
-        struct ggml_tensor * sum_abs_kept = ggml_sum_rows(gctx, ggml_abs(gctx, q_hat));
-
+        struct ggml_tensor * sum_abs_kept = ggml_sum_rows(gctx, ggml_abs(gctx, q_hat));        
         
-
-
-
-
+        struct ggml_cgraph * gf = ggml_new_graph(gctx);
+        ggml_build_forward_expand(gf, q_hat);
+        ggml_build_forward_expand(gf, k_hat);
+        ggml_build_forward_expand(gf, idx);
+        ggml_build_forward_expand(gf, sum_abs_kept);
+        ggml_build_forward_expand(gf, sum_abs_all);
+        
+        ggml_backend_buffer_t scratch = ggml_backend_alloc_ctx_tensors(gctx, backend);
+        const float two_v = 2.0f;
+        const float one_v = 1.0f;
+        ggml_backend_tensor_set(two, &two_v, 0, sizeof(two_v));
+        ggml_backend_tensor_set(one, &one_v, 0, sizeof(one_v));
+        ggml_backend_graph_compute(backend, gf);
+        if (scratch) ggml_backend_buffer_free(scratch);
+        ggml_free(gctx);
 }
