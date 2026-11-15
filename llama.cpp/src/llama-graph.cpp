@@ -3270,8 +3270,8 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     // compute HSA only when decoding
-    const int64_t n_kv k->ne[2];
-    const bool hsa_decode = n_tokens == 1 && n_kv > 0 && il >= hsa_skip_layers;
+    const int64_t n_kv = k->ne[2];
+    const bool hsa_decode = n_tokens == 1 && n_kv > 0 && il >= cparams.hsa_skip_layers;
     ggml_tensor *cur;
     if (!hsa_decode) {
         cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
@@ -3437,7 +3437,7 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
 
     // select out the top r indices from the q, k vectors
     ggml_tensor * q_hat = hsa_perm(ctx0 
-        ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3);
+    ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3);
     ggml_tensor * k_hat = hsa_perm(ctx0, 
         ggml_get_rows(ctx0, hsa_perm(ctx0, chunk_max, 1, 0, 2, 3), i1), 1, 0, 2, 3);
         
@@ -3543,7 +3543,38 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    const int64_t n_kv = k->ne[2];
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const int64_t D = hparams.n_embd_head_k(il);
+    const int64_t Hq = hparams.n_head(il);
+    const int64_t Hkv = hparams.n_head_kv(il);
+    
+    const bool hsa = cparams.hsa_topk > 0
+        && cparams.hsa_chunk > 0
+        && cparams.hsa_r > 0
+        && il >= cparams.hsa_skip_layers
+        && n_tokens == 1
+        && n_kv > 0
+        && k->ne[3] == 1
+        && !v_trans
+        && D > 0
+        && D == hparams.n_embd_head_v(il)
+        && Hkv > 0
+        && Hq % Hkv == 0
+        && q->ne[0] == D
+        && q->ne[1] == Hq
+        && kq_b == nullptr
+        && sinks == nullptr
+        && v_mla == nullptr
+        && kv_rows == nullptr
+        && kq_mask
+        && kq_mask->ne[0] == n_kv
+        && kq_mask->ne[1] == n_tokens;
+
+    ggml_tensor * cur = hsa
+        ? build_hsa_decode(q, k, v, kq_mask, kq_scale, il)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
