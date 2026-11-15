@@ -4485,6 +4485,11 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.hsa_skip_layers                   =*/ 0,
+        /*.hsa_chunk                   =*/ 0,
+        /*.hsa_r                   =*/ 0,
+        /*.hsa_topk                   =*/ 0,
+
     };
 
     return result;
@@ -4712,6 +4717,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_hsa_params(llama_context *ctx, int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk) {
+    ctx->set_hsa_params(skip_layers, chunk, r, topk);
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {
