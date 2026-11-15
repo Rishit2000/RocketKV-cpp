@@ -3366,6 +3366,7 @@ static ggml_tensor * build_attn_scale_kv_output(
     return cur;
 }
 
+// de-quantize any quantized KV cache to be compatible with sign, multipy, max-pool, and softmax
 static ggml_tensor *hsa_f32(ggml_context *ctx, ggml_tensor *t) {
     return t->type == GGML_TYPE_F32 ? t: ggml_cast(ctx, t, GGML_TYPE_F32);
 }
@@ -3373,6 +3374,82 @@ static ggml_tensor *hsa_f32(ggml_context *ctx, ggml_tensor *t) {
 // essentially pytorch.rearrange for four-dimensional tensors
 static ggml_tensor *hsa_perm(ggml_context *ctx, ggml_tensor *t, int a0, int a1, int a2, int a3) {
     return ggml_cont(ctx, ggml_permute(ctx, t, a0, a1, a2, a3));
+}
+
+
+// Stage-2 of RocketKV
+ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_mask, float kq_scale, int il) const {
+
+    const int64_t D = q->ne[0];
+    // kv_heads
+    const int64_t Hkv  = k->ne[1];
+    // num_attn_heads
+    const int64_t Hq   = q->ne[1];
+    const int64_t H    = Hq / Hkv;
+    // dim_head
+    const int64_t n_kv = k->ne[2];
+    const int chunk = cparams.hsa_chunk;
+    int r = cparams.hsa_r;
+    if (r > (int) D) {
+        r = (int) D;
+    }
+    const int64_t n_keep = std::min<int64_t>(cparams.hsa_topk, n_kv);
+    const int pad = (int) ((chunk - (n_kv % chunk)) % chunk);
+    const int64_t n_chunks = (n_kv + pad) / chunk;
+
+    GGML_ASSERT(H >= 1);
+    GGML_ASSERT(r >= 1 && n_keep >= 1 && n_chunks >= 1);
+
+    q = ggml_cont(ctx0, hsa_f32(ctx0, q));
+    k = hsa_f32(ctx0, k);
+    v = hsa_f32(ctx0, v);
+
+    // rocket.py: Q = h_q.view(batch, num_heads_kv, -1, len_q, dim_head); K = h_k.unsqueeze(2)
+    ggml_tensor * Q = ggml_reshape_4d(ctx0, q, D, H, Hkv, 1);
+    ggml_tensor * K = hsa_perm(ctx0, k, 0, 2, 1, 3);
+    ggml_tensor * V = hsa_perm(ctx0, v, 0, 2, 1, 3);
+
+    // sign = +1 when the sum over the group is positive, else -1 (a zero sum included)
+    ggml_tensor *group_sum = ggml_sum_rows(ctx0, hsa_perm(ctx0, Q, 1, 0, 2, 3));
+    ggml_tensor * one = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1.0f);
+    ggml_tensor * sign = ggml_sub(ctx0, ggml_scale(ctx0, ggml_step(ctx0, group_sum), 2.0f), one);
+    sign = hsa_perm(ctx0, sign, 1, 0, 2, 3);
+
+    ggml_tensor * Qs = ggml_mul(ctx0, Q, sign);
+    ggml_tensor * Ks = ggml_mul(ctx0, K, sign);
+
+    // apply causal masking before computing element-wise min and max for pages 
+    ggml_tensor * mask = ggml_cont(ctx0, hsa_f32(ctx0, kq_mask));
+    Ks = ggml_add(ctx0, Ks, ggml_reshape_4d(ctx0, mask, 1, n_kv, 1, 1));
+
+    ggml_tensor * ks = hsa_perm(ctx0, Ks, 1, 0, 2, 3);
+    if (pad > 0) {
+        ggml_tensor * tail = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, pad, D, Hkv, 1), -INFINITY);
+        ks = ggml_concat(ctx0, ks, tail, 0);
+    }
+
+    ggml_tensor * chunk_max = hsa_perm(ctx0, ggml_pool_1d(ctx0, ks, GGML_OP_POOL_MAX, chunk, chunk, 0), 1, 0, 2, 3);
+
+    // i1 = topk(abs(Q).mean(dim=group), r)
+    ggml_tensor *abs_q = ggml_abs(ctx0, Q);
+    ggml_tensor * head_score = hsa_perm(ctx0, ggml_mean(ctx0, hsa_perm(ctx0, abs_q, 1, 0, 2, 3)), 1, 0, 2, 3);
+    ggml_tensor * i1 = hsa_perm(ctx0, ggml_top_k(ctx0, head_score, r), 0, 2, 1, 3);
+
+    // select out the top r indices from the q, k vectors
+    ggml_tensor * q_hat = hsa_perm(ctx0 
+        ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3);
+    ggml_tensor * k_had = hsa_perm(ctx0, 
+        ggml_get_rows(ctx0, hsa_perm(ctx0, chunk_max, 1, 0, 2, 3), i1), 1, 0, 2, 3);
+
+
+
+
+
+
+
+
+
+
 }
 
 ggml_tensor * llm_graph_context::build_attn(
