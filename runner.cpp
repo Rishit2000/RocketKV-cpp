@@ -35,11 +35,6 @@ struct DecodeHold {
 
 static DecodeHold g_dec;
 
-static void append_decode_key() {
-
-
-
-}
 
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
