@@ -3438,18 +3438,47 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
     // select out the top r indices from the q, k vectors
     ggml_tensor * q_hat = hsa_perm(ctx0 
         ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3);
-    ggml_tensor * k_had = hsa_perm(ctx0, 
+    ggml_tensor * k_hat = hsa_perm(ctx0, 
         ggml_get_rows(ctx0, hsa_perm(ctx0, chunk_max, 1, 0, 2, 3), i1), 1, 0, 2, 3);
+        
+        
+    ggml_tensor *qk = ggml_mul_mat(ctx0, k_hat, q_hat);
+    qk = ggml_reshape_4d(ctx0, qk, 1, n_chunks, H, Hkv);
+    qk = ggml_repeat_4d(ctx0, qk, chunk, n_chunks, H, Hkv);
+    qk = ggml_reshape_3d(ctx0, qk, chunk * n_chunks, H, Hkv);
+    qk = ggml_cont(ctx0, ggml_view_3d(ctx0, qk, n_kv, H, Hkv, qk->nb[1], qk->nb[2], 0));
+    qk = ggml_add(ctx0, qk, mask);
 
+    // scale = sqrt(D * sum(|Q_hat|) / sum(|Q|)); s_hat = softmax(QK_hat / scale)
+    ggml_tensor * eps = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1e-6f);
+    ggml_tensor * sum_kept = ggml_sum_rows(ctx0, ggml_abs, ctx0, q_hat);
+    ggml_tensor * sum_all = ggml_sum_rows(ctx0, abs_q);
+    ggml_tensor * scale = ggml_sqrt(ctx0, ggml_add(ctx0,
+            ggml_div(ctx0, ggml_scale(ctx0, sum_kept, (float) D), ggml_add(ctx0, sum_all, eps)),
+            eps));
+    ggml_tensor * s_hat = ggml_soft_max(ctx0, ggml_div(ctx0, qk, scale));
 
+    // _, i2 = topk(s_hat.mean(dim=group), k) along the sequence
+    ggml_tensor * group = hsa_perm(ctx0,
+            ggml_mean(ctx0, hsa_perm(ctx0, s_hat, 1, 0, 2, 3)), 1, 0, 2, 3); // [n_kv, 1, Hkv, 1]
+    group = ggml_add(ctx0, group, mask);
+    ggml_tensor * iKV = hsa_perm(ctx0, ggml_top_k(ctx0, group, (int) n_keep), 0, 2, 1, 3);
 
+    // s = softmax((Q @ gather(K, iKV).T) / sqrt(D)); o = s @ gather(V, iKV)
+    ggml_tensor * Ksel = ggml_get_rows(ctx0, K, iKV);
+    ggml_tensor * Vsel = ggml_get_rows(ctx0, V, iKV);
+    ggml_tensor * qk_exact = ggml_mul_mat(ctx0, Ksel, Q);
+    ggml_tensor * probs = ggml_soft_max_ext(ctx0, qk_exact, nullptr, kq_scale, 0.0f);
+    Vsel = ggml_cont(ctx0, ggml_transpose(ctx0, Vsel));
+    ggml_tensor * out = ggml_mul_mat(ctx0, Vsel, probs);
+    out = ggml_cont_2d(ctx0, out, D * Hq, n_tokens);
 
-
-
-
-
-
-
+    cb(out, "hsa_kqv", il);
+    if (!cparams.offload_kqv) {
+        ggml_backend_sched_set_tensor_backend(sched, out, backend_cpu);
+    }
+    ggml_build_forward_expand(gf, out);
+    return out;
 }
 
 ggml_tensor * llm_graph_context::build_attn(
