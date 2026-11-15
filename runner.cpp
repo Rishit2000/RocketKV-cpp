@@ -22,6 +22,7 @@ struct PrefillActivations {
 
 static PrefillActivations g_acts;
 
+// tensors stored in unified 
 struct DecodeHold {
     ggml_context *ctx = nullptr;
     ggml_backend_t backend = nullptr;
@@ -34,6 +35,11 @@ struct DecodeHold {
 
 static DecodeHold g_dec;
 
+static void append_decode_key() {
+
+
+
+}
 
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
@@ -238,6 +244,12 @@ static InferenceOutput run_inference(
         config.r_dim = 0;
     }
 
+    if (enable_rocket && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
+        llama_set_hsa_params(ctx, 0, config.chunk_size, config.r_dim, config.topk_decode);
+    } else {
+        llama_set_hsa_params(ctx, 0, 0, 0, 0);
+    }
+
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
     for (int i = 0; i < n_tokens; i++) {
         batch.token[i] = tokens[i];
@@ -350,11 +362,8 @@ static InferenceOutput run_inference(
         batch_decode.logits[0] = true;
         batch_decode.n_tokens = 1;
 
-        g_dec.enabled = enable_rocket;
         if (llama_decode(ctx, batch_decode) != 0) break;
         llama_synchronize(ctx);
-        run_hsa_head_dim_graph(g_dec.backend, g_dec.q, g_dec.k, config);
-        g_dec.enabled = false;
 
         n_cur++;
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
@@ -499,6 +508,8 @@ int main(int argc, char ** argv) {
 
     if (enable_rocket) {
         ctx_params.cb_eval = eval_callback;
+        // reserve extra nodes in the decode graph for storing rocketKV params
+        ctx_params.hsa_topk = 1;
     }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
