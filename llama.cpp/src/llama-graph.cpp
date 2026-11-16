@@ -3301,7 +3301,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ? build_hsa_decode(q, k, v, kq_mask, kq_scale, il)
         : build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
 
-        cb(cur, "kqv_out", il);
+    cb(cur, "kqv_out", il);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);

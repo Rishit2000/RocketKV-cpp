@@ -22,23 +22,11 @@ struct PrefillActivations {
 
 static PrefillActivations g_acts;
 
-// tensors stored in unified 
-struct DecodeHold {
-    ggml_context *ctx = nullptr;
-    ggml_backend_t backend = nullptr;
-    ggml_tensor *q = nullptr;
-    ggml_tensor *k = nullptr;
-    ggml_backend_buffer_t q_buf = nullptr;
-    ggml_backend_buffer_t k_buf = nullptr;
-    bool enabled = false;
-};
-
-static DecodeHold g_dec;
 
 
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
-    if (!g_acts.enabled && !g_dec.enabled) return false;
+    if (!g_acts.enabled) return false;
 
     const char * name = t->name;
     if (!name) return false;
@@ -61,28 +49,6 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     int n_tokens_ubatch = t->ne[2];
 
     if (n_tokens_ubatch <= 1) {
-        if (!g_dec.enabled) return true;
-        // decode stage with single-token tensor
-
-        if (!g_dec.ctx) {
-            ggml_init_params ip = {16 * 1024 * 1024, nullptr, true};
-            g_dec.ctx = ggml_init(ip);
-            g_dec.backend = ggml_backend_buffer_get_backend(t->buffer);
-        }
-
-        ggml_tensor ** slot = is_q ? &g_dec.q : &g_dec.k;
-        ggml_backend_buffer_t * slot_buf = is_q ? &g_dec.q_buf : &g_dec.k_buf;
-        if (!*slot) {
-            *slot = ggml_new_tensor_3d(g_dec.ctx, t->type, t->ne[0], t->ne[1], t->ne[2]);
-            size_t n_bytes = ggml_nbytes(*slot);
-            size_t align = ggml_backend_get_alignment(g_dec.backend);
-            size_t bytes = ((n_bytes + align - 1) / align) * align;
-            *slot_buf = ggml_backend_buft_alloc_buffer(
-                ggml_backend_get_default_buffer_type(g_dec.backend),
-                bytes);
-            ggml_backend_tensor_alloc(*slot_buf, *slot, nullptr, ggml_backend_buffer_get_base(*slot_buf));
-        }
-        ggml_backend_tensor_copy(t, *slot);
         return true;
     }
 
@@ -499,7 +465,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_ubatch = std::min(1024u, (uint32_t)ctx_params.n_batch);
     ctx_params.type_k = kv_type;
     ctx_params.type_v = kv_type;
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     if (enable_rocket) {
         ctx_params.cb_eval = eval_callback;

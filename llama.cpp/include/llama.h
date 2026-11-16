@@ -431,7 +431,7 @@ extern "C" {
         // add RocketKV params to llama context
         // layer index up to which we use regular dense attention
         int32_t hsa_skip_layers;
-        int32_t hsa_chunk;
+        int32_t hsa_chunk; // chunk size, which is compression_ratio > chunk_size >= 1
         int32_t hsa_r; // k1 in the paper, used for head dim. reduction
         // leave this as 0 if using regular dense attention.
         int32_t hsa_topk; // k2 in the paper, used for sequence dim. reduction
