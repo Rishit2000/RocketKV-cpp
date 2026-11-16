@@ -3436,7 +3436,7 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
     ggml_tensor * i1 = hsa_perm(ctx0, ggml_top_k(ctx0, head_score, r), 0, 2, 1, 3);
 
     // select out the top r indices from the q, k vectors
-    ggml_tensor * q_hat = hsa_perm(ctx0 
+    ggml_tensor * q_hat = hsa_perm(ctx0,
     ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3);
     ggml_tensor * k_hat = hsa_perm(ctx0, 
         ggml_get_rows(ctx0, hsa_perm(ctx0, chunk_max, 1, 0, 2, 3), i1), 1, 0, 2, 3);
@@ -3451,7 +3451,7 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
 
     // scale = sqrt(D * sum(|Q_hat|) / sum(|Q|)); s_hat = softmax(QK_hat / scale)
     ggml_tensor * eps = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1e-6f);
-    ggml_tensor * sum_kept = ggml_sum_rows(ctx0, ggml_abs, ctx0, q_hat);
+    ggml_tensor * sum_kept = ggml_sum_rows(ctx0, ggml_abs( ctx0, q_hat));
     ggml_tensor * sum_all = ggml_sum_rows(ctx0, abs_q);
     ggml_tensor * scale = ggml_sqrt(ctx0, ggml_add(ctx0,
             ggml_div(ctx0, ggml_scale(ctx0, sum_kept, (float) D), ggml_add(ctx0, sum_all, eps)),
