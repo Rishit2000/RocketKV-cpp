@@ -3447,15 +3447,17 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
     ggml_tensor * Qs = ggml_mul(ctx0, Q, sign);
 
     // One f32 copy of K in the layout pool_1d can read: [n_kv, D, Hkv, 1].
+    // ggml_permute args are the destination of each source axis.
+    // (1, 2, 0, 3) maps [D, Hkv, n_kv, 1] to [n_kv, D, Hkv, 1].
     // f16/bf16: the cast of the permuted view transposes and converts in one kernel.
     // Quantized: dequant along ne[0] first, then transpose.
     ggml_tensor * ks;
     if (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) {
-        ks = hsa_f32(ctx0, ggml_permute(ctx0, k, 2, 0, 1, 3));
+        ks = hsa_f32(ctx0, ggml_permute(ctx0, k, 1, 2, 0, 3));
     } else if (k->type == GGML_TYPE_F32) {
-        ks = ggml_cont(ctx0, ggml_permute(ctx0, k, 2, 0, 1, 3));
+        ks = ggml_cont(ctx0, ggml_permute(ctx0, k, 1, 2, 0, 3));
     } else {
-        ks = ggml_cont(ctx0, ggml_permute(ctx0, hsa_f32(ctx0, k), 2, 0, 1, 3));
+        ks = ggml_cont(ctx0, ggml_permute(ctx0, hsa_f32(ctx0, k), 1, 2, 0, 3));
     }
 
     
@@ -3481,7 +3483,7 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
     ggml_tensor * take_max = ggml_step(ctx0, sign);
     ggml_tensor * chunk_key = ggml_mul(ctx0, ggml_add(ctx0,
             ggml_mul(ctx0, chunk_max, take_max),
-            ggml_mul(ctx0, chunk_min, ggml_sub(ctx0, one, take_max))), sign);
+            ggml_mul(ctx0, chunk_min, ggml_sub(ctx0, ggml_repeat(ctx0, one, take_max), take_max))), sign);
 
     // i1 = topk(abs(Q).mean(dim=group), r)
     ggml_tensor *abs_q = ggml_abs(ctx0, Q);
