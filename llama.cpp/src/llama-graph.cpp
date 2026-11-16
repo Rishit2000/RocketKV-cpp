@@ -3271,16 +3271,37 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // compute HSA only when decoding
     const int64_t n_kv = k->ne[2];
-    const bool hsa_decode = n_tokens == 1 && n_kv > 0 && il >= cparams.hsa_skip_layers;
-    ggml_tensor *cur;
-    if (!hsa_decode) {
-        cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
-    } else {
-        // select only top-k keys and values to compute attn. scores over
-        cur = build_hsa_decode(q, k, v, kq_mask, kq_scale, il);
-    }
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const int64_t D   = hparams.n_embd_head_k(il);
+    const int64_t Hq  = hparams.n_head(il);
+    const int64_t Hkv = hparams.n_head_kv(il);
+    const bool hsa_decode = cparams.hsa_topk > 0
+        && cparams.hsa_chunk > 0
+        && cparams.hsa_r > 0
+        && il >= cparams.hsa_skip_layers
+        && n_tokens == 1
+        && n_kv > 0
+        && k->ne[3] == 1
+        && !v_trans
+        && D > 0
+        && D == hparams.n_embd_head_v(il)
+        && Hkv > 0
+        && Hq % Hkv == 0
+        && q->ne[0] == D
+        && q->ne[1] == Hq
+        && kq_b == nullptr
+        && sinks == nullptr
+        && v_mla == nullptr
+        && kv_rows == nullptr
+        && kq_mask
+        && kq_mask->ne[0] == n_kv
+        && kq_mask->ne[1] == n_tokens;
 
-    cb(cur, "kqv_out", il);
+    ggml_tensor * cur = hsa_decode
+        ? build_hsa_decode(q, k, v, kq_mask, kq_scale, il)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+
+        cb(cur, "kqv_out", il);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
