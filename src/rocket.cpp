@@ -120,6 +120,17 @@ std::vector<int> compute_prefill_eviction(
     #pragma omp parallel for
     for (int h_kv = 0; h_kv < cfg.num_heads_kv; ++h_kv) {
         std::vector<float> head_scores(non_obs_k, 0.0f);
+        const int grouped_keys = non_obs_k / 4 * 4;
+        std::vector<float> packed_keys((size_t)grouped_keys * cfg.dim_head);
+        for (int t = 0; t < grouped_keys; t += 4) {
+            const float* src = K + (h_kv * len_k + t) * cfg.dim_head;
+            float* dst = packed_keys.data() + (size_t)t * cfg.dim_head;
+            for (int d = 0; d < cfg.dim_head; ++d) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    dst[4 * d + lane] = src[lane * cfg.dim_head + d];
+                }
+            }
+        }
 
         for (int h_rel = 0; h_rel < heads_per_kv; ++h_rel) {
             int h = h_kv * heads_per_kv + h_rel;
@@ -133,16 +144,16 @@ std::vector<int> compute_prefill_eviction(
 
                 // Causal dot product up to the non-observation boundary
                 int k_idx = 0;
-                // Interleave independent dots without reordering each dot's accumulation.
+                // Contiguous lanes vectorize independent dots without reordering their sums.
                 for (; k_idx + 3 < non_obs_k; k_idx += 4) {
-                    const float* k_ptr = K + (h_kv * len_k + k_idx) * cfg.dim_head;
+                    const float* k_ptr = packed_keys.data() + (size_t)k_idx * cfg.dim_head;
                     float dot0 = 0.0f, dot1 = 0.0f, dot2 = 0.0f, dot3 = 0.0f;
                     for (int d = 0; d < cfg.dim_head; ++d) {
                         const float q = q_ptr[d];
-                        dot0 += q * k_ptr[d];
-                        dot1 += q * k_ptr[cfg.dim_head + d];
-                        dot2 += q * k_ptr[2 * cfg.dim_head + d];
-                        dot3 += q * k_ptr[3 * cfg.dim_head + d];
+                        dot0 += q * k_ptr[4 * d];
+                        dot1 += q * k_ptr[4 * d + 1];
+                        dot2 += q * k_ptr[4 * d + 2];
+                        dot3 += q * k_ptr[4 * d + 3];
                     }
                     logits[k_idx] = dot0 * inv_sqrt_d;
                     logits[k_idx + 1] = dot1 * inv_sqrt_d;
