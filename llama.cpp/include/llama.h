@@ -1126,6 +1126,19 @@ extern "C" {
     // modify llama API to specify parameters specific to HSA
     LLAMA_API void llama_set_hsa_params(struct llama_context *ctx, int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk);
 
+    // Host-selected HSA K/V row indices (cache cell ids) for flash_attn_ext_rows decode.
+    // Pass n_rows == 0 to clear. Indices must stay valid for the current KV layout.
+    LLAMA_API void llama_set_hsa_kv_rows(struct llama_context * ctx, const int32_t * rows, int32_t n_rows);
+
+    // Rebuild the HSA KT cache (chunk-wise Kmin/Kmax) from the current KV cache.
+    // Call after Stage-1 eviction so decode can re-score every step from current Q.
+    LLAMA_API bool llama_hsa_kt_rebuild(struct llama_context * ctx);
+    LLAMA_API void llama_hsa_kt_clear(struct llama_context * ctx);
+
+    // Recompute HSA row ids from a single-token Q [n_head * head_dim] using the host KT.
+    // Call before each decode step (uses this Q for the next forward).
+    LLAMA_API bool llama_hsa_select_from_q(struct llama_context * ctx, const float * q_token, int32_t n_head);
+
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 

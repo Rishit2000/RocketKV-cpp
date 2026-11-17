@@ -382,3 +382,157 @@ std::vector<float> compute_hybrid_sparse_decode(
 
     return final_output;
 }
+std::vector<int> compute_hsa_indices(
+    const float * Q_token,
+    const float * K,
+    int len_k,
+    const RocketConfig & cfg)
+{
+    std::vector<int> out;
+    if (!Q_token || !K || len_k <= 0 || cfg.topk_decode <= 0) {
+        return out;
+    }
+
+    const int heads_per_kv = std::max(1, cfg.num_heads / cfg.num_heads_kv);
+    const int chunk_size = (cfg.chunk_size > 0) ? cfg.chunk_size :
+        std::max(1, std::min((int)std::floor(cfg.compression_ratio), (int)std::ceil(std::sqrt(cfg.compression_ratio))));
+    const int num_chunks = (len_k + chunk_size - 1) / chunk_size;
+    int r = (cfg.r_dim > 0) ? cfg.r_dim :
+        std::min(cfg.dim_head, std::max(1, (int)std::round((float)cfg.dim_head * (float)chunk_size / cfg.compression_ratio)));
+    r = std::min(r, cfg.dim_head);
+    const int final_k = std::min(cfg.topk_decode, len_k);
+
+    // Consensus token scores across all GQA groups (sum of per-group page probs).
+    std::vector<float> token_score(len_k, 0.0f);
+
+    for (int h_kv = 0; h_kv < cfg.num_heads_kv; ++h_kv) {
+        const float * k_base = K + (h_kv * len_k * cfg.dim_head);
+        const float * q_group = Q_token + (h_kv * heads_per_kv * cfg.dim_head);
+
+        std::vector<TokenScore> abs_q_group(cfg.dim_head);
+        std::vector<float> group_q_sum(cfg.dim_head, 0.0f);
+        std::vector<float> sum_abs_all(heads_per_kv, 0.0f);
+
+        for (int d = 0; d < cfg.dim_head; ++d) {
+            float sum_abs_d = 0.0f;
+            float sum_val_d = 0.0f;
+            for (int h = 0; h < heads_per_kv; ++h) {
+                float q_val = q_group[h * cfg.dim_head + d];
+                float abs_val = std::abs(q_val);
+                sum_abs_d += abs_val;
+                sum_val_d += q_val;
+                sum_abs_all[h] += abs_val;
+            }
+            abs_q_group[d] = {sum_abs_d, d};
+            group_q_sum[d] = sum_val_d;
+        }
+
+        std::vector<float> sign(cfg.dim_head);
+        for (int d = 0; d < cfg.dim_head; ++d) {
+            sign[d] = (group_q_sum[d] > 0.0f) ? 1.0f : -1.0f;
+        }
+
+        std::vector<int> top_r_dims(r);
+        std::vector<float> sum_abs_kept(heads_per_kv, 0.0f);
+        if (r >= cfg.dim_head) {
+            for (int d = 0; d < cfg.dim_head; ++d) top_r_dims[d] = d;
+            sum_abs_kept = sum_abs_all;
+        } else {
+            std::nth_element(
+                abs_q_group.begin(), abs_q_group.begin() + r, abs_q_group.end(),
+                [](const TokenScore & a, const TokenScore & b) { return a.score > b.score; });
+            for (int ri = 0; ri < r; ++ri) {
+                int d = abs_q_group[ri].memory_idx;
+                top_r_dims[ri] = d;
+                for (int h = 0; h < heads_per_kv; ++h) {
+                    sum_abs_kept[h] += std::abs(q_group[h * cfg.dim_head + d]);
+                }
+            }
+        }
+
+        std::vector<float> custom_scale(heads_per_kv);
+        for (int h = 0; h < heads_per_kv; ++h) {
+            custom_scale[h] = std::sqrt((float)cfg.dim_head * (sum_abs_kept[h] / (sum_abs_all[h] + 1e-9f)));
+        }
+
+        std::vector<float> chunk_logits(heads_per_kv * num_chunks, 0.0f);
+        for (int c = 0; c < num_chunks; ++c) {
+            int start_tok = c * chunk_size;
+            int end_tok = std::min(start_tok + chunk_size, len_k);
+            std::vector<float> P_chunk(r);
+            for (int ri = 0; ri < r; ++ri) {
+                int d = top_r_dims[ri];
+                if (sign[d] >= 0.0f) {
+                    float max_val = -FLT_MAX;
+                    for (int t = start_tok; t < end_tok; ++t) {
+                        max_val = std::max(max_val, k_base[t * cfg.dim_head + d]);
+                    }
+                    P_chunk[ri] = max_val;
+                } else {
+                    float min_val = FLT_MAX;
+                    for (int t = start_tok; t < end_tok; ++t) {
+                        min_val = std::min(min_val, k_base[t * cfg.dim_head + d]);
+                    }
+                    P_chunk[ri] = min_val;
+                }
+            }
+            for (int h = 0; h < heads_per_kv; ++h) {
+                float head_approx = 0.0f;
+                const float * q_h = q_group + h * cfg.dim_head;
+                for (int ri = 0; ri < r; ++ri) {
+                    head_approx += q_h[top_r_dims[ri]] * P_chunk[ri];
+                }
+                chunk_logits[h * num_chunks + c] = head_approx / custom_scale[h];
+            }
+        }
+
+        for (int h = 0; h < heads_per_kv; ++h) {
+            float max_l = -FLT_MAX;
+            for (int c = 0; c < num_chunks; ++c) {
+                max_l = std::max(max_l, chunk_logits[h * num_chunks + c]);
+            }
+            float sum_exp = 0.0f;
+            std::vector<float> probs(num_chunks);
+            for (int c = 0; c < num_chunks; ++c) {
+                probs[c] = std::exp(chunk_logits[h * num_chunks + c] - max_l);
+                sum_exp += probs[c];
+            }
+            float inv_sum = 1.0f / (sum_exp + 1e-9f);
+            for (int c = 0; c < num_chunks; ++c) {
+                float p = probs[c] * inv_sum;
+                int start_tok = c * chunk_size;
+                int end_tok = std::min(start_tok + chunk_size, len_k);
+                for (int t = start_tok; t < end_tok; ++t) {
+                    token_score[t] += p;
+                }
+            }
+        }
+    }
+
+    std::vector<TokenScore> ranked(len_k);
+    for (int t = 0; t < len_k; ++t) {
+        ranked[t] = {token_score[t], t};
+    }
+    if (final_k < len_k) {
+        std::nth_element(
+            ranked.begin(), ranked.begin() + final_k, ranked.end(),
+            [](const TokenScore & a, const TokenScore & b) {
+                if (a.score != b.score) return a.score > b.score;
+                return a.memory_idx < b.memory_idx;
+            });
+        ranked.resize(final_k);
+    }
+
+    out.reserve(final_k + cfg.window_size);
+    for (const auto & ts : ranked) {
+        out.push_back(ts.memory_idx);
+    }
+    // Always keep the local observation window.
+    const int win = std::min(cfg.window_size, len_k);
+    for (int t = len_k - win; t < len_k; ++t) {
+        out.push_back(t);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}

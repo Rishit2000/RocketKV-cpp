@@ -131,6 +131,20 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
+// Host-selected HSA K/V row list for ggml_flash_attn_ext_rows
+class llm_graph_input_hsa_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_hsa_rows(std::vector<int32_t> rows) : rows_data(std::move(rows)) {}
+    ~llm_graph_input_hsa_rows() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * rows = nullptr; // I32 [n_rows, 1]
+    std::vector<int32_t> rows_data;
+};
+
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
@@ -903,9 +917,14 @@ struct llm_graph_params {
 
         // comparator for  chunk, r, and topk - which may change over iters
         if (cparams.hsa_skip_layers != other.cparams.hsa_skip_layers ||
-            cparams.hsa_chunk != other.cparams.hsa_chunk || 
-            cparams.hsa_r != other.cparams.hsa_r || 
-            cparams.hsa_topk != other.cparams.hsa_topk) {
+            cparams.hsa_chunk != other.cparams.hsa_chunk ||
+            cparams.hsa_r != other.cparams.hsa_r ||
+            cparams.hsa_topk != other.cparams.hsa_topk ||
+            // Row *content* may change each step; capacity is kept stable by set_hsa_kv_rows.
+            cparams.hsa_kv_rows_n != other.cparams.hsa_kv_rows_n ||
+            cparams.hsa_recent_window != other.cparams.hsa_recent_window ||
+            cparams.hsa_kt_ready != other.cparams.hsa_kt_ready ||
+            cparams.hsa_n_chunks != other.cparams.hsa_n_chunks) {
                 return false;
         }
 
@@ -943,6 +962,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_hsa_q()       const { return t_hsa_q; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -984,6 +1004,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_hsa_q       = nullptr; // [D, Hq, 1] decode Q for host HSA select (last layer)
 
     std::vector<ggml_tensor *> t_layer_inp;
 

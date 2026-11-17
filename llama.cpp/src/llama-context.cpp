@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1709,6 +1710,366 @@ void llama_context::set_hsa_params(int32_t skip_layers, int32_t chunk, int32_t r
     cparams.hsa_r = std::max(0, r);
     cparams.hsa_topk = std::max(0, topk);
 
+    if (cparams.hsa_topk <= 0 || cparams.hsa_chunk <= 0 || cparams.hsa_r <= 0) {
+        hsa_kt_clear();
+    }
+}
+
+void llama_context::set_hsa_kv_rows(const int32_t * rows, int32_t n_rows) {
+    if (!rows || n_rows <= 0) {
+        hsa_kv_rows_storage.clear();
+        cparams.hsa_kv_rows = nullptr;
+        cparams.hsa_kv_rows_n = 0;
+        return;
+    }
+    hsa_kv_rows_storage.assign(rows, rows + n_rows);
+    cparams.hsa_kv_rows = hsa_kv_rows_storage.data();
+    cparams.hsa_kv_rows_n = (int32_t) hsa_kv_rows_storage.size();
+}
+
+void llama_context::hsa_kt_clear() {
+    hsa_kt.ready = false;
+    hsa_kt.chunk = 0;
+    hsa_kt.n_chunks = 0;
+    hsa_kt.n_layer = 0;
+    hsa_kt.D = 0;
+    hsa_kt.Hkv = 0;
+    hsa_kt.n_kv = 0;
+    hsa_kt.k_max.clear();
+    hsa_kt.k_min.clear();
+    hsa_kt.k_max_host.clear();
+    hsa_kt.k_min_host.clear();
+    hsa_kt.live.clear();
+    hsa_kt.k_live.clear();
+    hsa_kt.k_max_live.clear();
+    hsa_kt.k_min_live.clear();
+    hsa_kt.live_cells.clear();
+    hsa_kt.n_live = 0;
+    hsa_kt.n_chunks_live = 0;
+    hsa_kt.buf.reset();
+    hsa_kt.ctx.reset();
+    cparams.hsa_kt_ready = false;
+    cparams.hsa_n_chunks = 0;
+    cparams.hsa_k_max = nullptr;
+    cparams.hsa_k_min = nullptr;
+}
+
+bool llama_context::hsa_kt_rebuild() {
+    hsa_kt_clear();
+
+    if (cparams.hsa_chunk <= 0 || cparams.hsa_topk <= 0 || cparams.hsa_r <= 0) {
+        return false;
+    }
+
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    if (!kv) {
+        LLAMA_LOG_WARN("%s: HSA KT requires a standard KV cache\n", __func__);
+        return false;
+    }
+
+    const int chunk = cparams.hsa_chunk;
+    const auto & cells = kv->get_cells(0);
+    const uint32_t n_kv = cells.used_max_p1();
+    if (n_kv == 0) {
+        return false;
+    }
+
+    const int n_chunks = (int) ((n_kv + chunk - 1) / chunk);
+    const int n_layer = model.hparams.n_layer();
+    // Use layer 0 head geometry; HSA path asserts D matches V and GQA.
+    const int D = model.hparams.n_embd_head_k(0);
+    const int Hkv = model.hparams.n_head_kv(0);
+    if (D <= 0 || Hkv <= 0 || n_chunks <= 0) {
+        return false;
+    }
+
+    const size_t n_tensors = (size_t) n_layer * 2;
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * n_tensors,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    hsa_kt.ctx.reset(ggml_init(params));
+    if (!hsa_kt.ctx) {
+        return false;
+    }
+
+    hsa_kt.k_max.resize(n_layer, nullptr);
+    hsa_kt.k_min.resize(n_layer, nullptr);
+    for (int il = 0; il < n_layer; ++il) {
+        hsa_kt.k_max[il] = ggml_new_tensor_3d(hsa_kt.ctx.get(), GGML_TYPE_F32, D, n_chunks, Hkv);
+        hsa_kt.k_min[il] = ggml_new_tensor_3d(hsa_kt.ctx.get(), GGML_TYPE_F32, D, n_chunks, Hkv);
+        ggml_set_name(hsa_kt.k_max[il], ("hsa_k_max-" + std::to_string(il)).c_str());
+        ggml_set_name(hsa_kt.k_min[il], ("hsa_k_min-" + std::to_string(il)).c_str());
+    }
+
+    ggml_backend_dev_t dev = model.dev_layer(0);
+    auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+    hsa_kt.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(hsa_kt.ctx.get(), buft));
+    if (!hsa_kt.buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate HSA KT buffer\n", __func__);
+        hsa_kt_clear();
+        return false;
+    }
+
+    hsa_kt.k_max_host.assign(n_layer, std::vector<float>((size_t) D * n_chunks * Hkv));
+    hsa_kt.k_min_host.assign(n_layer, std::vector<float>((size_t) D * n_chunks * Hkv));
+    hsa_kt.live.assign(n_kv, 0);
+    for (uint32_t t = 0; t < n_kv; ++t) {
+        hsa_kt.live[t] = cells.is_empty(t) ? 0 : 1;
+    }
+
+    std::vector<uint8_t> k_raw;
+    std::vector<float> k_f32;
+
+    for (int il = 0; il < n_layer; ++il) {
+        std::vector<float> & k_max_host = hsa_kt.k_max_host[il];
+        std::vector<float> & k_min_host = hsa_kt.k_min_host[il];
+        ggml_tensor * k_store = kv->get_k_storage(il);
+        if (!k_store) {
+            hsa_kt_clear();
+            return false;
+        }
+
+        const int64_t n_embd_k_gqa = k_store->ne[0];
+        const int64_t kv_size = k_store->ne[1];
+        GGML_ASSERT(n_embd_k_gqa == (int64_t) D * Hkv);
+        GGML_ASSERT(kv_size >= (int64_t) n_kv);
+
+        const size_t n_elem = (size_t) n_embd_k_gqa * n_kv;
+        k_raw.resize(ggml_row_size(k_store->type, n_embd_k_gqa) * n_kv);
+        ggml_backend_tensor_get(k_store, k_raw.data(), 0, k_raw.size());
+
+        k_f32.resize(n_elem);
+        if (k_store->type == GGML_TYPE_F32) {
+            memcpy(k_f32.data(), k_raw.data(), n_elem * sizeof(float));
+        } else if (k_store->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) k_raw.data(), k_f32.data(), n_elem);
+        } else if (k_store->type == GGML_TYPE_BF16) {
+            ggml_bf16_to_fp32_row((const ggml_bf16_t *) k_raw.data(), k_f32.data(), n_elem);
+        } else {
+            // Quantized K: dequantize via ggml helper if available; otherwise fail closed.
+            LLAMA_LOG_WARN("%s: unsupported K type %d for HSA KT rebuild\n", __func__, (int) k_store->type);
+            hsa_kt_clear();
+            return false;
+        }
+
+        std::fill(k_max_host.begin(), k_max_host.end(), -INFINITY);
+        std::fill(k_min_host.begin(), k_min_host.end(), +INFINITY);
+
+        for (uint32_t t = 0; t < n_kv; ++t) {
+            if (cells.is_empty(t)) {
+                continue;
+            }
+            const int c = (int) (t / chunk);
+            for (int h = 0; h < Hkv; ++h) {
+                const float * src = k_f32.data() + (size_t) t * n_embd_k_gqa + (size_t) h * D;
+                // KT layout [D, n_chunks, Hkv]: idx = d + c*D + h*D*n_chunks
+                for (int d = 0; d < D; ++d) {
+                    const size_t idx = (size_t) d + (size_t) c * D + (size_t) h * D * n_chunks;
+                    k_max_host[idx] = std::max(k_max_host[idx], src[d]);
+                    k_min_host[idx] = std::min(k_min_host[idx], src[d]);
+                }
+            }
+        }
+
+        // Empty chunks: neutral values so sign*max/min stays well-defined.
+        for (size_t i = 0; i < k_max_host.size(); ++i) {
+            if (!std::isfinite(k_max_host[i])) {
+                k_max_host[i] = 0.0f;
+            }
+            if (!std::isfinite(k_min_host[i])) {
+                k_min_host[i] = 0.0f;
+            }
+        }
+
+        ggml_backend_tensor_set(hsa_kt.k_max[il], k_max_host.data(), 0, k_max_host.size() * sizeof(float));
+        ggml_backend_tensor_set(hsa_kt.k_min[il], k_min_host.data(), 0, k_min_host.size() * sizeof(float));
+
+        // Compact live K + KT for last layer (chunked over live tokens, matches rocket).
+        if (il == n_layer - 1) {
+            hsa_kt.live_cells.clear();
+            hsa_kt.live_cells.reserve(n_kv);
+            for (uint32_t t = 0; t < n_kv; ++t) {
+                if (!cells.is_empty(t)) {
+                    hsa_kt.live_cells.push_back((int32_t) t);
+                }
+            }
+            hsa_kt.n_live = (int) hsa_kt.live_cells.size();
+            hsa_kt.n_chunks_live = (hsa_kt.n_live + chunk - 1) / chunk;
+            hsa_kt.k_live.assign((size_t) Hkv * hsa_kt.n_live * D, 0.0f);
+            hsa_kt.k_max_live.assign((size_t) Hkv * hsa_kt.n_chunks_live * D, -INFINITY);
+            hsa_kt.k_min_live.assign((size_t) Hkv * hsa_kt.n_chunks_live * D, +INFINITY);
+            for (int li = 0; li < hsa_kt.n_live; ++li) {
+                const uint32_t t = (uint32_t) hsa_kt.live_cells[li];
+                const int c = li / chunk;
+                for (int h = 0; h < Hkv; ++h) {
+                    const float * src = k_f32.data() + (size_t) t * n_embd_k_gqa + (size_t) h * D;
+                    float * dst = hsa_kt.k_live.data() + ((size_t) h * hsa_kt.n_live + li) * D;
+                    memcpy(dst, src, (size_t) D * sizeof(float));
+                    for (int d = 0; d < D; ++d) {
+                        const size_t idx = ((size_t) h * hsa_kt.n_chunks_live + c) * D + d;
+                        hsa_kt.k_max_live[idx] = std::max(hsa_kt.k_max_live[idx], src[d]);
+                        hsa_kt.k_min_live[idx] = std::min(hsa_kt.k_min_live[idx], src[d]);
+                    }
+                }
+            }
+            for (size_t i = 0; i < hsa_kt.k_max_live.size(); ++i) {
+                if (!std::isfinite(hsa_kt.k_max_live[i])) hsa_kt.k_max_live[i] = 0.0f;
+                if (!std::isfinite(hsa_kt.k_min_live[i])) hsa_kt.k_min_live[i] = 0.0f;
+            }
+        }
+    }
+
+    hsa_kt.ready = true;
+    hsa_kt.chunk = chunk;
+    hsa_kt.n_chunks = n_chunks;
+    hsa_kt.n_layer = n_layer;
+    hsa_kt.D = D;
+    hsa_kt.Hkv = Hkv;
+    hsa_kt.n_kv = n_kv;
+
+    // Keep device KT pointers available, but decode selection runs on host each step
+    // (flash_attn_ext_rows with uploaded row ids) to stay above full-kv tok/s.
+    cparams.hsa_kt_ready = false;
+    cparams.hsa_n_chunks = n_chunks;
+    cparams.hsa_k_max = hsa_kt.k_max.data();
+    cparams.hsa_k_min = hsa_kt.k_min.data();
+
+    LLAMA_LOG_INFO("%s: HSA KT ready layers=%d chunks=%d D=%d Hkv=%d chunk=%d n_kv=%u (host select)\n",
+            __func__, n_layer, n_chunks, D, Hkv, chunk, n_kv);
+    return true;
+}
+
+bool llama_context::hsa_select_from_q(const float * q_token, int n_head) {
+    // Match rocket.cpp compute_hsa_indices: per-GQA-group sign/top-r, Q·P (no Q*sign),
+    // per-head page softmax summed into token scores. Uses compact live KT from rebuild.
+    if (!hsa_kt.ready || !q_token || n_head <= 0 || cparams.hsa_topk <= 0 || hsa_kt.n_live <= 0) {
+        return false;
+    }
+
+    const int D = hsa_kt.D;
+    const int Hkv = hsa_kt.Hkv;
+    const int chunk = hsa_kt.chunk;
+    const int n_live = hsa_kt.n_live;
+    const int n_chunks = hsa_kt.n_chunks_live;
+    const int heads_per_kv = std::max(1, n_head / Hkv);
+    const int r = std::min(cparams.hsa_r, D);
+    const int n_keep = std::min(cparams.hsa_topk, n_live);
+    if (r <= 0 || n_keep <= 0 || n_chunks <= 0 || hsa_kt.k_max_live.empty()) {
+        return false;
+    }
+
+    std::vector<float> token_score(n_live, 0.0f);
+    const float * k_max = hsa_kt.k_max_live.data();
+    const float * k_min = hsa_kt.k_min_live.data();
+
+    for (int h_kv = 0; h_kv < Hkv; ++h_kv) {
+        const float * q_group = q_token + (size_t) h_kv * heads_per_kv * D;
+        const float * kmx = k_max + (size_t) h_kv * n_chunks * D;
+        const float * kmn = k_min + (size_t) h_kv * n_chunks * D;
+
+        std::vector<float> abs_dim(D, 0.0f);
+        std::vector<float> sum_dim(D, 0.0f);
+        std::vector<float> sum_abs_all(heads_per_kv, 0.0f);
+        for (int d = 0; d < D; ++d) {
+            for (int h = 0; h < heads_per_kv; ++h) {
+                const float qv = q_group[h * D + d];
+                abs_dim[d] += std::fabs(qv);
+                sum_dim[d] += qv;
+                sum_abs_all[h] += std::fabs(qv);
+            }
+        }
+
+        std::vector<float> sign(D);
+        for (int d = 0; d < D; ++d) {
+            sign[d] = (sum_dim[d] > 0.0f) ? 1.0f : -1.0f;
+        }
+
+        std::vector<int> dims(D);
+        for (int d = 0; d < D; ++d) dims[d] = d;
+        std::nth_element(dims.begin(), dims.begin() + r, dims.end(),
+                [&](int a, int b) { return abs_dim[a] > abs_dim[b]; });
+        dims.resize(r);
+
+        std::vector<float> sum_abs_kept(heads_per_kv, 0.0f);
+        for (int h = 0; h < heads_per_kv; ++h) {
+            for (int ri = 0; ri < r; ++ri) {
+                sum_abs_kept[h] += std::fabs(q_group[h * D + dims[ri]]);
+            }
+        }
+
+        std::vector<float> scale(heads_per_kv);
+        for (int h = 0; h < heads_per_kv; ++h) {
+            scale[h] = std::sqrt((float) D * (sum_abs_kept[h] / (sum_abs_all[h] + 1e-9f)));
+        }
+
+        std::vector<float> chunk_logits((size_t) heads_per_kv * n_chunks, 0.0f);
+        for (int c = 0; c < n_chunks; ++c) {
+            for (int h = 0; h < heads_per_kv; ++h) {
+                const float * qh = q_group + h * D;
+                float approx = 0.0f;
+                for (int ri = 0; ri < r; ++ri) {
+                    const int d = dims[ri];
+                    const float p = (sign[d] >= 0.0f) ? kmx[(size_t) c * D + d] : kmn[(size_t) c * D + d];
+                    approx += qh[d] * p;
+                }
+                chunk_logits[(size_t) h * n_chunks + c] = approx / scale[h];
+            }
+        }
+
+        for (int h = 0; h < heads_per_kv; ++h) {
+            float max_l = -INFINITY;
+            for (int c = 0; c < n_chunks; ++c) {
+                max_l = std::max(max_l, chunk_logits[(size_t) h * n_chunks + c]);
+            }
+            float sum_exp = 0.0f;
+            std::vector<float> probs(n_chunks);
+            for (int c = 0; c < n_chunks; ++c) {
+                probs[c] = std::exp(chunk_logits[(size_t) h * n_chunks + c] - max_l);
+                sum_exp += probs[c];
+            }
+            const float inv = 1.0f / (sum_exp + 1e-9f);
+            for (int c = 0; c < n_chunks; ++c) {
+                const float p = probs[c] * inv;
+                const int t0 = c * chunk;
+                const int t1 = std::min(t0 + chunk, n_live);
+                for (int t = t0; t < t1; ++t) {
+                    token_score[t] += p;
+                }
+            }
+        }
+    }
+
+    struct Sc { float s; int i; };
+    std::vector<Sc> ranked(n_live);
+    for (int t = 0; t < n_live; ++t) {
+        ranked[t] = {token_score[t], t};
+    }
+    if (n_keep < n_live) {
+        std::nth_element(ranked.begin(), ranked.begin() + n_keep, ranked.end(),
+                [](const Sc & a, const Sc & b) {
+                    if (a.s != b.s) return a.s > b.s;
+                    return a.i < b.i;
+                });
+        ranked.resize(n_keep);
+    }
+
+    std::vector<int32_t> rows;
+    rows.reserve(ranked.size() + cparams.hsa_recent_window);
+    for (const auto & sc : ranked) {
+        rows.push_back(hsa_kt.live_cells[sc.i]);
+    }
+    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+    const uint32_t n_kv_now = kv ? kv->get_cells(0).used_max_p1() : hsa_kt.n_kv;
+    const int win = std::min(cparams.hsa_recent_window, (int) n_kv_now);
+    for (int t = (int) n_kv_now - win; t < (int) n_kv_now; ++t) {
+        if (t >= 0) rows.push_back(t);
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    set_hsa_kv_rows(rows.data(), (int32_t) rows.size());
+    return true;
 }
 
 bool llama_context::get_causal_attn() const {
@@ -2551,6 +2912,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        // Async capture of last-layer decode Q for host HSA row refresh.
+        if (ggml_tensor * t_hsa_q = res->get_hsa_q()) {
+            const int D = (int) t_hsa_q->ne[0];
+            const int Hq = (int) t_hsa_q->ne[1];
+            const size_t n_elem = (size_t) D * Hq;
+            if (hsa_q_host.size() != n_elem) {
+                hsa_q_host.assign(n_elem, 0.0f);
+            }
+            hsa_q_D = D;
+            hsa_q_Hq = Hq;
+            ggml_backend_t backend_q = ggml_backend_sched_get_tensor_backend(sched.get(), t_hsa_q);
+            if (backend_q) {
+                ggml_backend_tensor_get_async(backend_q, t_hsa_q, hsa_q_host.data(), 0, n_elem * sizeof(float));
+                hsa_q_pending = true;
+            }
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2631,6 +3009,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // Refresh HSA rows from this step's Q for the next decode.
+    if (hsa_q_pending && hsa_kt.ready && hsa_q_D > 0 && hsa_q_Hq > 0 && !hsa_q_host.empty()) {
+        synchronize();
+        std::vector<float> planar((size_t) hsa_q_D * hsa_q_Hq);
+        for (int h = 0; h < hsa_q_Hq; ++h) {
+            for (int d = 0; d < hsa_q_D; ++d) {
+                planar[(size_t) h * hsa_q_D + d] = hsa_q_host[(size_t) d + (size_t) h * hsa_q_D];
+            }
+        }
+        hsa_select_from_q(planar.data(), hsa_q_Hq);
+        hsa_q_pending = false;
+    }
 
     return 0;
 }
@@ -4721,6 +5112,22 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 void llama_set_hsa_params(llama_context *ctx, int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk) {
     ctx->set_hsa_params(skip_layers, chunk, r, topk);
+}
+
+void llama_set_hsa_kv_rows(llama_context * ctx, const int32_t * rows, int32_t n_rows) {
+    ctx->set_hsa_kv_rows(rows, n_rows);
+}
+
+bool llama_hsa_kt_rebuild(llama_context * ctx) {
+    return ctx->hsa_kt_rebuild();
+}
+
+void llama_hsa_kt_clear(llama_context * ctx) {
+    ctx->hsa_kt_clear();
+}
+
+bool llama_hsa_select_from_q(llama_context * ctx, const float * q_token, int32_t n_head) {
+    return ctx->hsa_select_from_q(q_token, n_head);
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {

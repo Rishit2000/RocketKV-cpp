@@ -139,6 +139,14 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_hsa_params(int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk);
+    void set_hsa_kv_rows(const int32_t * rows, int32_t n_rows);
+
+    // Rebuild per-layer KT (chunk Kmin/Kmax) from the current KV cache. Call after Stage-1 eviction.
+    bool hsa_kt_rebuild();
+    void hsa_kt_clear();
+
+    // Select HSA rows from host KT using a single-token Q [n_head * D].
+    bool hsa_select_from_q(const float * q_token, int n_head);
     
     void set_warmup(bool value);
 
@@ -428,6 +436,46 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // Host HSA row ids for flash_attn_ext_rows (see set_hsa_kv_rows)
+    std::vector<int32_t> hsa_kv_rows_storage;
+
+    // Persistent KT cache for per-step HSA selection (gpt-fast RocketKV)
+    struct hsa_kt_state {
+        bool ready = false;
+        int chunk = 0;
+        int n_chunks = 0;
+        int n_layer = 0;
+        int D = 0;
+        int Hkv = 0;
+        uint32_t n_kv = 0;
+
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+        std::vector<ggml_tensor *> k_max;
+        std::vector<ggml_tensor *> k_min;
+
+        // Host mirrors for CPU re-scoring each decode step (layer-major: [il][d,c,h])
+        std::vector<std::vector<float>> k_max_host;
+        std::vector<std::vector<float>> k_min_host;
+        std::vector<uint8_t> live; // [n_kv] 1 if cell occupied at rebuild
+
+        // Compact live K + KT for fidelity with compute_hsa_indices (last layer).
+        // k_live: [Hkv, n_live, D]; k_*_live: [Hkv, n_chunks_live, D]
+        std::vector<float> k_live;
+        std::vector<float> k_max_live;
+        std::vector<float> k_min_live;
+        std::vector<int32_t> live_cells; // maps local index → cell id
+        int n_live = 0;
+        int n_chunks_live = 0;
+    };
+    hsa_kt_state hsa_kt;
+
+    // Decode-Q capture for host HSA reselect (filled async from t_hsa_q)
+    std::vector<float> hsa_q_host; // storage [D, Hq]
+    int hsa_q_D = 0;
+    int hsa_q_Hq = 0;
+    bool hsa_q_pending = false;
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different

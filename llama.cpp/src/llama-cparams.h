@@ -79,4 +79,16 @@ struct llama_cparams {
     int32_t hsa_chunk = 0;
     int32_t hsa_r = 0;
     int32_t hsa_topk = 0;
+
+    // Persistent KT cache (element-wise chunk Kmin/Kmax), owned by llama_context.
+    // When ready, build_hsa_decode re-scores every decode step from current Q (gpt-fast fidelity).
+    bool hsa_kt_ready = false;
+    int32_t hsa_n_chunks = 0;
+    ggml_tensor * const * hsa_k_max = nullptr; // [D, n_chunks, Hkv] per layer
+    ggml_tensor * const * hsa_k_min = nullptr;
+    int32_t hsa_recent_window = 32;
+
+    // Legacy one-shot host rows (optional fallback when KT is not ready).
+    const int32_t * hsa_kv_rows = nullptr;
+    int32_t hsa_kv_rows_n = 0;
 };

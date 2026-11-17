@@ -53,6 +53,55 @@ static std::vector<float> compute_exact_dense_decode(
     return out;
 }
 
+static double time_channel_slice_us(const float * Q, int len_k, const RocketConfig & cfg) {
+    const int H = std::max(1, cfg.num_heads / cfg.num_heads_kv);
+    const int D = cfg.dim_head;
+    const int chunk = (cfg.chunk_size > 0) ? cfg.chunk_size :
+        std::max(1, std::min((int)std::floor(cfg.compression_ratio),
+                             (int)std::ceil(std::sqrt(cfg.compression_ratio))));
+    int r = (cfg.r_dim > 0) ? cfg.r_dim :
+        std::min(D, std::max(1, (int)std::round((float)D * (float)chunk / cfg.compression_ratio)));
+    r = std::min(r, D);
+
+    auto once = [&]() {
+        float sink = 0.f;
+        #pragma omp parallel for reduction(+:sink)
+        for (int kv = 0; kv < cfg.num_heads_kv; ++kv) {
+            const float * q = Q + kv * H * D;
+            std::vector<float> abs_sum(D), val_sum(D, 0.f), sum_all(H, 0.f), sum_kept(H, 0.f);
+            for (int d = 0; d < D; ++d) {
+                float a = 0.f, s = 0.f;
+                for (int h = 0; h < H; ++h) {
+                    float v = q[h * D + d];
+                    a += std::fabs(v);
+                    s += v;
+                    sum_all[h] += std::fabs(v);
+                }
+                abs_sum[d] = a;
+                val_sum[d] = s;
+            }
+            std::vector<int> order(D);
+            for (int d = 0; d < D; ++d) order[d] = d;
+            std::nth_element(order.begin(), order.begin() + r, order.end(),
+                [&](int a, int b) { return abs_sum[a] > abs_sum[b]; });
+            for (int ri = 0; ri < r; ++ri) {
+                int d = order[ri];
+                sink += val_sum[d] > 0.f ? 1.f : -1.f;
+                for (int h = 0; h < H; ++h) sum_kept[h] += std::fabs(q[h * D + d]);
+            }
+            for (int h = 0; h < H; ++h) sink += sum_all[h] + sum_kept[h];
+        }
+        return sink;
+    };
+
+    once();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    volatile float keep = once();
+    (void)keep;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "RocketKV C++ Algorithmic Verification" << std::endl;
@@ -160,10 +209,14 @@ int main() {
     }
 
     // Compute RocketKV hybrid sparse decode across all GQA groups
+    double channel_us = time_channel_slice_us(Q_all.data(), decode_len_k, cfg);
     auto t_start_decode = std::chrono::high_resolution_clock::now();
     auto sparse_out = compute_hybrid_sparse_decode(Q_all.data(), K_decode.data(), V_decode.data(), decode_len_k, cfg);
     auto t_end_decode = std::chrono::high_resolution_clock::now();
     double decode_us = std::chrono::duration<double, std::micro>(t_end_decode - t_start_decode).count();
+
+    std::cout << "  Channel slice: " << channel_us << " us ("
+          << (100.0 * channel_us / decode_us) << "% of full HSA)\n";
 
     float cos_sim = cosine_similarity(exact_out, sparse_out);
     std::cout << "  Total Query heads evaluated: " << cfg.num_heads << " (" << cfg.num_heads_kv << " KV groups)" << std::endl;

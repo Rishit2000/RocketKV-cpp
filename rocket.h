@@ -48,3 +48,13 @@ std::vector<int> compute_prefill_eviction(
 std::vector<float> compute_hybrid_sparse_decode(
     const float* Q, const float* K, const float* V,
     int len_k, const RocketConfig& cfg);
+
+// Stage-2 HSA token indices for one query (last prompt token).
+// Q: [num_heads, dim_head] for a single token (or pass q_token pointing at that slice)
+// K: [num_heads_kv, len_k, dim_head]
+// Returns sorted unique indices into [0, len_k), including the local window.
+std::vector<int> compute_hsa_indices(
+    const float * Q_token,
+    const float * K,
+    int len_k,
+    const RocketConfig & cfg);

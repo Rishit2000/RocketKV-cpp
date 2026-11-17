@@ -1,9 +1,12 @@
 #include "hsa_graph.h"
 
+// helper to rearrange axes of a tensor
 static struct ggml_tensor * perm_cont(struct ggml_context * ctx, struct ggml_tensor * t, 
                                       int a0, int a1, int a2, int a3) {
     return ggml_cont(ctx, ggml_permute(ctx, t, a0, a1, a2, a3));
 }
+
+
 
 void run_hsa_head_dim_graph(
     ggml_backend_t backend,
@@ -52,14 +55,14 @@ void run_hsa_head_dim_graph(
         struct ggml_tensor * abs_q = ggml_abs(gctx, Q);
         // scores is dim (D, 1, Hkv, 1) tensor now
         struct ggml_tensor * scores = perm_cont(gctx, 
-            ggml_mean(gcctx, perm_cont(gctx, abs_q, 1, 0, 2, 3)), 1, 0, 2, 3);
+            ggml_mean(gcctx, perm_cont(gctx, abs_q, 1, 0, 2, 3)), 2, 0, 1, 3);
         struct ggml_tensor * idx = ggml_top_k(gctx, scores, r);
 
         // pick out the top-r entries of q by mean absolute value
-        struct ggml_tensor * q_hat = perm_cont(gctx, 
-            ggml_get_rows(gctx, perm_cont(gctx, Qs, 1, 0, 2, 3), idx), 1, 0, 2, 3);
-        struct ggml_tensor * k_hat = perm_cont(gctx,
-            ggml_get_rows(gctx, perm_cont(gctx, Ks, 1, 0, 2, 3), idx), 1, 0, 2, 3);
+        // struct ggml_tensor * q_hat = perm_cont(gctx, 
+        //     ggml_get_rows(gctx, perm_cont(gctx, Qs, 1, 0, 2, 3), idx), 1, 0, 2, 3);
+        // struct ggml_tensor * k_hat = perm_cont(gctx,
+        //     ggml_get_rows(gctx, perm_cont(gctx, Ks, 1, 0, 2, 3), idx), 1, 0, 2, 3);
         struct ggml_tensor * sub_abs_all = ggml_sum_rows(gctx, abs_q);
         struct ggml_tensor * sum_abs_kept = ggml_sum_rows(gctx, ggml_abs(gctx, q_hat));        
         

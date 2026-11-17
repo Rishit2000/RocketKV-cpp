@@ -131,6 +131,21 @@ static llm_attn_mask build_attn_inp_attn_mask(
 
 // impl
 
+void llm_graph_input_hsa_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!rows || rows_data.empty()) {
+        return;
+    }
+    GGML_ASSERT(rows->ne[0] == (int64_t) rows_data.size());
+    ggml_backend_tensor_set(rows, rows_data.data(), 0, rows_data.size() * sizeof(int32_t));
+}
+
+bool llm_graph_input_hsa_rows::can_reuse(const llm_graph_params & params) {
+    // Row tensor length is padded to Metal NCPSG; reuse as long as capacity matches.
+    GGML_UNUSED(params);
+    return rows && rows->ne[0] == (int64_t) rows_data.size();
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1424,6 +1439,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_hsa_q       = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1471,6 +1487,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
+    }
+    if (t_hsa_q != nullptr) {
+        ggml_set_output(t_hsa_q);
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
@@ -3280,7 +3299,7 @@ ggml_tensor * llm_graph_context::build_attn(
         && cparams.hsa_r > 0
         && il >= cparams.hsa_skip_layers
         && n_tokens == 1
-        && n_kv > 0
+        && n_kv > cparams.hsa_topk
         && k->ne[3] == 1
         && !v_trans
         && D > 0
@@ -3398,16 +3417,16 @@ static ggml_tensor *hsa_perm(ggml_context *ctx, ggml_tensor *t, int a0, int a1, 
 }
 
 
-// Stage-2 of RocketKV
+// Stage-2 of RocketKV (HSA decode graph), gpt-fast fidelity:
+//   - persistent KT (chunk Kmin/Kmax) scored with the current decode Q every step
+//   - top-k token indices from approximate scores
+//   - exact attention via Metal flash_attn_ext_rows
+// Falls back to a recent-window / host-row path when KT is not ready.
 ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * kq_mask, float kq_scale, int il) const {
-
-    const int64_t D = q->ne[0];
-    // kv_heads
-    const int64_t Hkv  = k->ne[1];
-    // num_attn_heads
-    const int64_t Hq   = q->ne[1];
-    const int64_t H    = Hq / Hkv;
-    // dim_head
+    const int64_t D   = q->ne[0];
+    const int64_t Hkv = k->ne[1];
+    const int64_t Hq  = q->ne[1];
+    const int64_t H   = Hq / Hkv;
     const int64_t n_kv = k->ne[2];
     const int chunk = cparams.hsa_chunk;
     int r = cparams.hsa_r;
@@ -3415,118 +3434,152 @@ ggml_tensor *llm_graph_context::build_hsa_decode(ggml_tensor * q, ggml_tensor * 
         r = (int) D;
     }
     const int64_t n_keep = std::min<int64_t>(cparams.hsa_topk, n_kv);
-    const int pad = (int) ((chunk - (n_kv % chunk)) % chunk);
-    const int64_t n_chunks = (n_kv + pad) / chunk;
+    const int64_t rows_pad = 64;
+    const int64_t n_recent = std::min<int64_t>(
+            std::max<int64_t>(chunk, cparams.hsa_recent_window),
+            n_kv);
 
-    GGML_ASSERT(H >= 1);
-    GGML_ASSERT(r >= 1 && n_keep >= 1 && n_chunks >= 1);
+    const bool use_kt = cparams.hsa_kt_ready
+        && cparams.hsa_k_max
+        && cparams.hsa_k_min
+        && cparams.hsa_n_chunks > 0
+        && il < (int) n_layer
+        && cparams.hsa_k_max[il]
+        && cparams.hsa_k_min[il]
+        && chunk > 0
+        && r > 0
+        && n_keep > 0
+        && H >= 1;
 
-    q = ggml_cont(ctx0, hsa_f32(ctx0, q));
+    ggml_tensor * kv_rows = nullptr;
+    int64_t n_rows = 0;
 
-    // Quantized rows must be dequantized while ne[0] is still the head dimension.
-    // f16 and f32 are gathered as views; get_rows casts only the selected rows.
-    auto hsa_rows_ok = [](ggml_type type) {
-        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
-    };
-    ggml_tensor * K_src = hsa_rows_ok(k->type) ? k : hsa_f32(ctx0, k);
-    ggml_tensor * V_src = hsa_rows_ok(v->type) ? v : hsa_f32(ctx0, v);
-    // Incoming cache layout is [D, Hkv, n_kv, 1]. Sequence axis moves to dim 1.
-    ggml_tensor * K = ggml_permute(ctx0, K_src, 0, 2, 1, 3); // [D, n_kv, Hkv, 1]
-    ggml_tensor * V = ggml_permute(ctx0, V_src, 0, 2, 1, 3);
+    if (use_kt) {
+        const int64_t n_chunks = cparams.hsa_n_chunks;
+        ggml_tensor * k_max = cparams.hsa_k_max[il]; // [D, n_chunks, Hkv]
+        ggml_tensor * k_min = cparams.hsa_k_min[il];
+        const int64_t n_pages = std::max<int64_t>(1, std::min(n_chunks, (n_keep + chunk - 1) / chunk));
 
+        // Current decode Q: [D, Hq, 1] → GQA group mean → [D, 1, Hkv]
+        q = ggml_cont(ctx0, hsa_f32(ctx0, q));
+        ggml_tensor * Q = ggml_reshape_4d(ctx0, q, D, H, Hkv, 1);
+        ggml_tensor * Qkv = hsa_perm(ctx0, ggml_mean(ctx0, hsa_perm(ctx0, Q, 1, 0, 2, 3)), 1, 0, 2, 3); // [D, 1, Hkv, 1]
+        Qkv = ggml_reshape_3d(ctx0, Qkv, D, 1, Hkv);
 
-    // rocket.py: Q = h_q.view(batch, num_heads_kv, -1, len_q, dim_head); K = h_k.unsqueeze(2)
-    ggml_tensor * Q = ggml_reshape_4d(ctx0, q, D, H, Hkv, 1);
+        // gpt-fast sign: choose Kmax vs Kmin per dim from sign(Q)
+        ggml_tensor * one = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1.0f);
+        ggml_tensor * sign_kv = ggml_sub(ctx0, ggml_scale(ctx0, ggml_step(ctx0, Qkv), 2.0f), one);
+        ggml_tensor * take_max = ggml_step(ctx0, sign_kv);
+        ggml_tensor * chunk_key = ggml_mul(ctx0, ggml_add(ctx0,
+                ggml_mul(ctx0, k_max, take_max),
+                ggml_mul(ctx0, k_min, ggml_sub(ctx0, ggml_repeat(ctx0, one, take_max), take_max))), sign_kv);
 
-    // sign = +1 when the sum over the group is positive, else -1 (a zero sum included)
-    ggml_tensor *group_sum = ggml_sum_rows(ctx0, hsa_perm(ctx0, Q, 1, 0, 2, 3));
-    ggml_tensor * one = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1.0f);
-    ggml_tensor * sign = ggml_sub(ctx0, ggml_scale(ctx0, ggml_step(ctx0, group_sum), 2.0f), one);
-    sign = hsa_perm(ctx0, sign, 1, 0, 2, 3);
+        // Head-dim reduction: top-r by |Qkv|, gather on Q and chunk_key.
+        ggml_tensor * Qs = ggml_mul(ctx0, Qkv, sign_kv); // [D, 1, Hkv]
+        ggml_tensor * abs_q = ggml_abs(ctx0, Qkv);
+        // Mean |Q| over KV heads → one shared i1 (gpt-fast uses per-head; shared is cheaper and stable)
+        ggml_tensor * dim_score = ggml_mean(ctx0, ggml_reshape_2d(ctx0, abs_q, D, Hkv)); // [1, Hkv]? mean on rows of [D,Hkv] → [1,Hkv]
+        // Want score per dim: reshape to [Hkv, D], mean → [1, D]
+        dim_score = ggml_mean(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_2d(ctx0, abs_q, D, Hkv))));
+        dim_score = ggml_reshape_2d(ctx0, dim_score, D, 1);
+        ggml_tensor * i1 = ggml_reshape_1d(ctx0, ggml_top_k(ctx0, dim_score, r), r);
 
-    ggml_tensor * Qs = ggml_mul(ctx0, Q, sign);
+        ggml_tensor * Qs2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, Qs), D, Hkv); // [D, Hkv]
+        ggml_tensor * Ck2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, chunk_key), D, n_chunks * Hkv);
+        // Gather r rows from Qs2: need [D, Hkv] with get_rows selecting dim0 — permute first
+        ggml_tensor * q_hat = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Qs2)), i1); // [Hkv, r]
+        q_hat = ggml_cont(ctx0, ggml_transpose(ctx0, q_hat)); // [r, Hkv]
+        // chunk_key [D, n_chunks, Hkv] → [D, n_chunks*Hkv] → transpose [n_chunks*Hkv, D] get_rows → [n_chunks*Hkv, r]
+        ggml_tensor * k_hat = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, Ck2)), i1); // [n_chunks*Hkv, r]
+        k_hat = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, k_hat)), r, n_chunks, Hkv); // [r, n_chunks, Hkv]
+        q_hat = ggml_reshape_3d(ctx0, q_hat, r, 1, Hkv);
 
-    // One f32 copy of K in the layout pool_1d can read: [n_kv, D, Hkv, 1].
-    // ggml_permute args are the destination of each source axis.
-    // (1, 2, 0, 3) maps [D, Hkv, n_kv, 1] to [n_kv, D, Hkv, 1].
-    // f16/bf16: the cast of the permuted view transposes and converts in one kernel.
-    // Quantized: dequant along ne[0] first, then transpose.
-    ggml_tensor * ks;
-    if (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_BF16) {
-        ks = hsa_f32(ctx0, ggml_permute(ctx0, k, 1, 2, 0, 3));
-    } else if (k->type == GGML_TYPE_F32) {
-        ks = ggml_cont(ctx0, ggml_permute(ctx0, k, 1, 2, 0, 3));
+        // Page scores from current Q
+        ggml_tensor * qk = ggml_mul_mat(ctx0, k_hat, q_hat); // [n_chunks, 1, Hkv]
+        qk = ggml_reshape_2d(ctx0, ggml_cont(ctx0, qk), n_chunks, Hkv);
+        ggml_tensor * page_logits = ggml_mean(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, qk))); // [1, n_chunks]
+        page_logits = ggml_reshape_2d(ctx0, page_logits, n_chunks, 1);
+
+        ggml_tensor * pages = ggml_top_k(ctx0, page_logits, (int) n_pages);
+        pages = ggml_reshape_1d(ctx0, pages, n_pages);
+        ggml_tensor * pages_f = ggml_cast(ctx0, pages, GGML_TYPE_F32);
+
+        ggml_tensor * base = ggml_scale(ctx0, pages_f, (float) chunk);
+        ggml_tensor * rows_f = nullptr;
+        for (int o = 0; o < chunk; ++o) {
+            ggml_tensor * part = (o == 0) ? base : ggml_scale_bias(ctx0, base, 1.0f, (float) o);
+            rows_f = rows_f ? ggml_concat(ctx0, rows_f, part, 0) : part;
+        }
+        rows_f = ggml_clamp(ctx0, rows_f, 0.0f, (float) (n_kv - 1));
+        ggml_tensor * iKV = ggml_cast(ctx0, rows_f, GGML_TYPE_I32);
+
+        ggml_tensor * recent_f = ggml_arange(ctx0, (float) (n_kv - n_recent), (float) n_kv, 1.0f);
+        ggml_tensor * recent = ggml_cast(ctx0, recent_f, GGML_TYPE_I32);
+        ggml_tensor * rows_i32 = ggml_concat(ctx0, iKV, recent, 0);
+        const int64_t n_live = n_pages * chunk + n_recent;
+        n_rows = ((n_live + rows_pad - 1) / rows_pad) * rows_pad;
+        if (n_rows > n_live) {
+            ggml_tensor * pad = ggml_cast(ctx0,
+                    ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_rows - n_live), (float) (n_kv - 1)),
+                    GGML_TYPE_I32);
+            rows_i32 = ggml_concat(ctx0, rows_i32, pad, 0);
+        }
+        kv_rows = ggml_reshape_2d(ctx0, rows_i32, n_rows, 1);
+        (void) kq_mask;
     } else {
-        ks = ggml_cont(ctx0, ggml_permute(ctx0, hsa_f32(ctx0, k), 1, 2, 0, 3));
+        // Fallback: host one-shot rows or recent window only.
+        std::vector<int32_t> rows_host;
+        if (cparams.hsa_kv_rows_n > 0 && cparams.hsa_kv_rows) {
+            rows_host.assign(cparams.hsa_kv_rows, cparams.hsa_kv_rows + cparams.hsa_kv_rows_n);
+            for (int64_t t = n_kv - n_recent; t < n_kv; ++t) {
+                rows_host.push_back((int32_t) t);
+            }
+        } else {
+            rows_host.reserve(n_keep);
+            for (int64_t t = n_kv - n_keep; t < n_kv; ++t) {
+                rows_host.push_back((int32_t) t);
+            }
+        }
+        GGML_ASSERT(!rows_host.empty());
+        const int32_t pad_id = rows_host.back();
+        const int64_t n_live = (int64_t) rows_host.size();
+        n_rows = ((n_live + rows_pad - 1) / rows_pad) * rows_pad;
+        rows_host.resize(n_rows, pad_id);
+
+        auto inp = std::make_unique<llm_graph_input_hsa_rows>(std::move(rows_host));
+        inp->rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_rows, 1);
+        ggml_set_input(inp->rows);
+        ggml_set_name(inp->rows, "hsa_kv_rows");
+        kv_rows = inp->rows;
+        res->add_input(std::move(inp));
     }
 
-    
-    // kq_mask is 0 on live tokens and -inf on holes. pool_1d has no min, and
-    // max(sign * K) over a chunk is sign * max(K) or sign * min(K). min(K) = -max(-K)
-    // with the same -inf mask, so the sign is applied to the chunk tensors, not to every key.
-    ggml_tensor * mask = ggml_cont(ctx0, hsa_f32(ctx0, kq_mask));
-    ggml_tensor * mask_seq = ggml_reshape_4d(ctx0, mask, n_kv, 1, 1, 1);
-    ggml_tensor * max_in = ggml_add(ctx0, ks, mask_seq);
-    ggml_tensor * min_in = ggml_add(ctx0, ggml_scale(ctx0, ks, -1.0f), mask_seq);
-
-
-    if (pad > 0) {
-        ggml_tensor * tail = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, pad, D, Hkv, 1), -INFINITY);
-        max_in = ggml_concat(ctx0, max_in, tail, 0);
-        min_in = ggml_concat(ctx0, min_in, tail, 0);
+    // Exact sparse attention: Metal flash over selected K/V rows
+    // q is [D, Hq, 1] (possibly already f32-contiguous on the KT path)
+    ggml_tensor * q_fa = ggml_permute(ctx0, q, 0, 2, 1, 3); // [D, 1, Hq]
+    if (q_fa->type != GGML_TYPE_F32) {
+        q_fa = ggml_cast(ctx0, q_fa, GGML_TYPE_F32);
     }
+    ggml_tensor * k_fa = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    ggml_tensor * v_fa = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (k_fa->type == GGML_TYPE_F32) k_fa = ggml_cast(ctx0, k_fa, GGML_TYPE_F16);
+    if (v_fa->type == GGML_TYPE_F32) v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
 
-    ggml_tensor * chunk_max = hsa_perm(ctx0, ggml_pool_1d(ctx0, max_in, GGML_OP_POOL_MAX, chunk, chunk, 0), 1, 0, 2, 3);
-    ggml_tensor * chunk_min = ggml_scale(ctx0,
-            hsa_perm(ctx0, ggml_pool_1d(ctx0, min_in, GGML_OP_POOL_MAX, chunk, chunk, 0), 1, 0, 2, 3),
-            -1.0f);
-    ggml_tensor * take_max = ggml_step(ctx0, sign);
-    ggml_tensor * chunk_key = ggml_mul(ctx0, ggml_add(ctx0,
-            ggml_mul(ctx0, chunk_max, take_max),
-            ggml_mul(ctx0, chunk_min, ggml_sub(ctx0, ggml_repeat(ctx0, one, take_max), take_max))), sign);
+    ggml_tensor * fa_mask = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_rows, 1, 1, 1), 0.0f);
 
-    // i1 = topk(abs(Q).mean(dim=group), r)
-    ggml_tensor *abs_q = ggml_abs(ctx0, Q);
-    ggml_tensor * head_score = hsa_perm(ctx0, ggml_mean(ctx0, hsa_perm(ctx0, abs_q, 1, 0, 2, 3)), 1, 0, 2, 3);
-    ggml_tensor * i1 = hsa_perm(ctx0, ggml_top_k(ctx0, head_score, r), 0, 2, 1, 3);
+    ggml_tensor * out = ggml_flash_attn_ext_rows(ctx0, q_fa, k_fa, v_fa, fa_mask, kv_rows, kq_scale, 0.0f, 0.0f);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) n_rows);
+    out = ggml_reshape_2d(ctx0, out, D * Hq, 1);
 
-    // select out the top r indices from the q, k vectors
-    ggml_tensor * q_hat = hsa_perm(ctx0,
-    ggml_get_rows(ctx0, hsa_perm(ctx0, Qs, 1, 0, 2, 3), i1), 1, 0, 2, 3);
-    ggml_tensor * k_hat = hsa_perm(ctx0, 
-        ggml_get_rows(ctx0, hsa_perm(ctx0, chunk_key, 1, 0, 2, 3), i1), 1, 0, 2, 3);
-        
-        
-    ggml_tensor *qk = ggml_mul_mat(ctx0, k_hat, q_hat);
-    qk = ggml_reshape_4d(ctx0, qk, 1, n_chunks, H, Hkv);
-    qk = ggml_repeat_4d(ctx0, qk, chunk, n_chunks, H, Hkv);
-    qk = ggml_reshape_3d(ctx0, qk, chunk * n_chunks, H, Hkv);
-    qk = ggml_cont(ctx0, ggml_view_3d(ctx0, qk, n_kv, H, Hkv, qk->nb[1], qk->nb[2], 0));
-    qk = ggml_add(ctx0, qk, mask);
-
-    // scale = sqrt(D * sum(|Q_hat|) / sum(|Q|)); s_hat = softmax(QK_hat / scale)
-    ggml_tensor * eps = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 1e-6f);
-    ggml_tensor * sum_kept = ggml_sum_rows(ctx0, ggml_abs( ctx0, q_hat));
-    ggml_tensor * sum_all = ggml_sum_rows(ctx0, abs_q);
-    ggml_tensor * scale = ggml_sqrt(ctx0, ggml_add(ctx0,
-            ggml_div(ctx0, ggml_scale(ctx0, sum_kept, (float) D), ggml_add(ctx0, sum_all, eps)),
-            eps));
-    ggml_tensor * s_hat = ggml_soft_max(ctx0, ggml_div(ctx0, qk, scale));
-
-    // _, i2 = topk(s_hat.mean(dim=group), k) along the sequence
-    ggml_tensor * group = hsa_perm(ctx0,
-            ggml_mean(ctx0, hsa_perm(ctx0, s_hat, 1, 0, 2, 3)), 1, 0, 2, 3); // [n_kv, 1, Hkv, 1]
-    group = ggml_add(ctx0, group, mask);
-    ggml_tensor * iKV = hsa_perm(ctx0, ggml_top_k(ctx0, group, (int) n_keep), 0, 2, 1, 3);
-
-    // s = softmax((Q @ gather(K, iKV).T) / sqrt(D)); o = s @ gather(V, iKV)
-    ggml_tensor * Ksel = ggml_get_rows(ctx0, K, iKV);
-    ggml_tensor * Vsel = ggml_get_rows(ctx0, V, iKV);
-    ggml_tensor * qk_exact = ggml_mul_mat(ctx0, Ksel, Q);
-    ggml_tensor * probs = ggml_soft_max_ext(ctx0, qk_exact, nullptr, kq_scale, 0.0f);
-    Vsel = ggml_cont(ctx0, ggml_transpose(ctx0, Vsel));
-    ggml_tensor * out = ggml_mul_mat(ctx0, Vsel, probs);
-    out = ggml_cont_2d(ctx0, out, D * Hq, n_tokens);
+    // Keep last-layer decode Q alive for host HSA reselect (no eval-callback mid-graph sync).
+    if (il == (int) n_layer - 1 && q->ne[2] == 1 && res) {
+        ggml_tensor * q_cap = ggml_cont(ctx0, hsa_f32(ctx0, q));
+        ggml_set_name(q_cap, "hsa_q_cap");
+        ggml_set_output(q_cap);
+        ggml_build_forward_expand(gf, q_cap);
+        res->t_hsa_q = q_cap;
+    }
 
     cb(out, "hsa_kqv", il);
     if (!cparams.offload_kqv) {
@@ -3609,7 +3662,7 @@ ggml_tensor * llm_graph_context::build_attn(
         && cparams.hsa_r > 0
         && il >= cparams.hsa_skip_layers
         && n_tokens == 1
-        && n_kv > 0
+        && n_kv > cparams.hsa_topk
         && k->ne[3] == 1
         && !v_trans
         && D > 0

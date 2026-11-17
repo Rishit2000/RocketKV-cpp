@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 
 // Captured Q and K activations of the target layer during prefill
@@ -22,12 +23,15 @@ struct PrefillActivations {
 
 static PrefillActivations g_acts;
 
-
+// Decode-time Q of the target layer for per-step HSA host selection.
+static std::vector<float> g_decode_q; // [n_heads * dim_head]
+static bool g_decode_q_enabled = false;
+static ggml_tensor * g_decode_q_tensor = nullptr;
+static int g_decode_q_dim = 0;
+static int g_decode_q_heads = 0;
 
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
-    if (!g_acts.enabled) return false;
-
     const char * name = t->name;
     if (!name) return false;
 
@@ -42,11 +46,23 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         return false;
     }
 
-    if (ask) return true;
-
     int dim_head = t->ne[0];
     int n_heads = t->ne[1];
     int n_tokens_ubatch = t->ne[2];
+
+    // Decode Q: mark tensor during ask; download after llama_synchronize (avoid mid-graph stall).
+    if (g_decode_q_enabled && is_q && n_tokens_ubatch == 1) {
+        if (ask) {
+            g_decode_q_tensor = t;
+            g_decode_q_dim = dim_head;
+            g_decode_q_heads = n_heads;
+            return true;
+        }
+        return true;
+    }
+
+    if (!g_acts.enabled) return false;
+    if (ask) return true;
 
     if (n_tokens_ubatch <= 1) {
         return true;
@@ -157,6 +173,8 @@ static InferenceOutput run_inference(
     int max_tokens,
     int token_budget,
     bool enable_rocket,
+    bool enable_hsa,
+    int hsa_skip_layers,
     int context_len_limit,
     float bytes_per_elem,
     bool stream_stdout
@@ -205,10 +223,17 @@ static InferenceOutput run_inference(
         config.r_dim = 0;
     }
 
-    if (enable_rocket && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
-        llama_set_hsa_params(ctx, 0, config.chunk_size, config.r_dim, config.topk_decode);
+    // Stage 2 (HSA): host one-shot selection + flash_attn_ext_rows decode graph.
+    // Enable with --hsa 1 or ROCKET_HSA=1. Optional ROCKET_HSA_SKIP=N skips the first N layers.
+    if (enable_rocket && enable_hsa && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
+        int skip = hsa_skip_layers;
+        if (const char * env_skip = getenv("ROCKET_HSA_SKIP")) {
+            skip = atoi(env_skip);
+        }
+        llama_set_hsa_params(ctx, skip, config.chunk_size, config.r_dim, config.topk_decode);
     } else {
         llama_set_hsa_params(ctx, 0, 0, 0, 0);
+        llama_set_hsa_kv_rows(ctx, nullptr, 0);
     }
 
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
@@ -279,8 +304,55 @@ static InferenceOutput run_inference(
             llama_memory_seq_rm(mem, 0, range_start, n_tokens);
         }
 
+        // Stage-2 HSA: rebuild KT, then select rows from the last prompt Q.
+        if (enable_hsa && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
+            llama_set_hsa_kv_rows(ctx, nullptr, 0);
+            if (!llama_hsa_kt_rebuild(ctx)) {
+                std::cerr << "Warning: HSA KT rebuild failed; decode will use fallback rows\n";
+            } else if (!g_acts.q.empty() && !g_acts.k.empty()) {
+                // Initial rows from full-K HSA on kept tokens (matches PyTorch); later steps use KT.
+                const int n_kept = (int) kept_indices.size();
+                std::vector<float> q_tok(config.num_heads * config.dim_head, 0.0f);
+                for (int h = 0; h < config.num_heads; ++h) {
+                    const float * src = g_acts.q.data() + (h * n_tokens + (n_tokens - 1)) * config.dim_head;
+                    std::memcpy(q_tok.data() + h * config.dim_head, src, config.dim_head * sizeof(float));
+                }
+                std::vector<float> k_kept(config.num_heads_kv * n_kept * config.dim_head, 0.0f);
+                for (int h = 0; h < config.num_heads_kv; ++h) {
+                    for (int i = 0; i < n_kept; ++i) {
+                        const int src_t = kept_indices[i];
+                        const float * src = g_acts.k.data() + (h * n_tokens + src_t) * config.dim_head;
+                        float * dst = k_kept.data() + (h * n_kept + i) * config.dim_head;
+                        std::memcpy(dst, src, config.dim_head * sizeof(float));
+                    }
+                }
+                std::vector<int> local = compute_hsa_indices(q_tok.data(), k_kept.data(), n_kept, config);
+                std::vector<int32_t> rows;
+                rows.reserve(local.size());
+                for (int li : local) {
+                    if (li >= 0 && li < n_kept) rows.push_back((int32_t) kept_indices[li]);
+                }
+                llama_set_hsa_kv_rows(ctx, rows.data(), (int32_t) rows.size());
+            }
+        }
+
         int64_t t_evict_end = ggml_time_us();
         evict_ms = (t_evict_end - t_evict_start) / 1000.0;
+    } else if (enable_rocket && enable_hsa && config.chunk_size > 0 && config.r_dim > 0
+            && config.topk_decode > 0) {
+        llama_set_hsa_kv_rows(ctx, nullptr, 0);
+        if (!llama_hsa_kt_rebuild(ctx)) {
+            std::cerr << "Warning: HSA KT rebuild failed; decode will use fallback rows\n";
+        } else if (!g_acts.q.empty() && !g_acts.k.empty()) {
+            std::vector<float> q_tok(config.num_heads * config.dim_head, 0.0f);
+            for (int h = 0; h < config.num_heads; ++h) {
+                const float * src = g_acts.q.data() + (h * n_tokens + (n_tokens - 1)) * config.dim_head;
+                std::memcpy(q_tok.data() + h * config.dim_head, src, config.dim_head * sizeof(float));
+            }
+            std::vector<int> local = compute_hsa_indices(q_tok.data(), g_acts.k.data(), n_tokens, config);
+            std::vector<int32_t> rows(local.begin(), local.end());
+            llama_set_hsa_kv_rows(ctx, rows.data(), (int32_t) rows.size());
+        }
     }
 
     // Release prefill activation buffers
@@ -298,6 +370,11 @@ static InferenceOutput run_inference(
 
     // Sample the initial token generated from the prefill prompt
     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
+
+    // Per-step HSA reselect runs inside llama_decode (in-graph Q capture, no eval callback).
+    g_decode_q_enabled = false;
+    g_decode_q_tensor = nullptr;
+    g_acts.enabled = false;
 
     int64_t t_start_decode = ggml_time_us();
 
@@ -329,6 +406,9 @@ static InferenceOutput run_inference(
         n_cur++;
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
     }
+
+    g_decode_q_enabled = false;
+    g_decode_q_tensor = nullptr;
 
     int64_t t_end_decode = ggml_time_us();
 
@@ -417,8 +497,15 @@ int main(int argc, char ** argv) {
     int context_len_limit = 0;
     int window_size = 32;
     int kernel_size = 63;
+    // Default on with rocket; disable with --hsa 0 or ROCKET_HSA=0.
+    bool enable_hsa = true;
+    int hsa_skip_layers = 0;
     std::string batch_file = "";
     std::string output_file = "";
+
+    if (const char * env_hsa = getenv("ROCKET_HSA")) {
+        enable_hsa = (std::string(env_hsa) == "1" || std::string(env_hsa) == "true");
+    }
 
     // Argument parsing
     for (int i = 1; i < argc; ++i) {
@@ -431,6 +518,11 @@ int main(int argc, char ** argv) {
             std::string v = argv[++i];
             enable_rocket = (v == "1" || v == "true");
         }
+        else if (arg == "--hsa" && i + 1 < argc) {
+            std::string v = argv[++i];
+            enable_hsa = (v == "1" || v == "true");
+        }
+        else if (arg == "--hsa-skip" && i + 1 < argc) hsa_skip_layers = safe_stoi(argv[++i], 0);
         else if (arg == "--n-ctx" && i + 1 < argc) n_ctx_override = safe_stoi(argv[++i], n_ctx_override);
         else if (arg == "--context-len" && i + 1 < argc) context_len_limit = safe_stoi(argv[++i], 0);
         else if (arg == "--window-size" && i + 1 < argc) window_size = safe_stoi(argv[++i], 32);
@@ -465,7 +557,7 @@ int main(int argc, char ** argv) {
     ctx_params.n_ubatch = std::min(1024u, (uint32_t)ctx_params.n_batch);
     ctx_params.type_k = kv_type;
     ctx_params.type_v = kv_type;
-    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
     if (enable_rocket) {
         ctx_params.cb_eval = eval_callback;
@@ -523,7 +615,7 @@ int main(int argc, char ** argv) {
 
             InferenceOutput res = run_inference(
                 ctx, model, vocab, ctx_params, config, prompt,
-                req_max_tokens, token_budget, enable_rocket,
+                req_max_tokens, token_budget, enable_rocket, enable_hsa, hsa_skip_layers,
                 context_len_limit, bytes_per_elem, false
             );
 
