@@ -1132,6 +1132,8 @@ extern "C" {
 
     // Rebuild the HSA KT cache (chunk-wise Kmin/Kmax) from the current KV cache.
     // Call after Stage-1 eviction so decode can re-score every step from current Q.
+    // Bounds update automatically for single-token appends to sequence 0. Other cache changes
+    // invalidate the bounds; decode then computes HSA scores directly from the current keys.
     LLAMA_API bool llama_hsa_kt_rebuild(struct llama_context * ctx);
     LLAMA_API void llama_hsa_kt_clear(struct llama_context * ctx);
 

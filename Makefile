@@ -12,8 +12,8 @@ test_rocket: test_rocket.cpp rocket.cpp
 runner: runner.cpp rocket.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-test_hsa_graph: test_hsa_graph.cpp
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+test_hsa_graph: test_hsa_graph.cpp rocket.cpp hsa_graph.h
+	$(CXX) $(CXXFLAGS) -I$(LLAMA_DIR)/src $(filter %.cpp,$^) -o $@ $(LDFLAGS)
 
 clean:
 	rm -f runner test_rocket

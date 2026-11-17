@@ -1046,7 +1046,7 @@ bool llama_context::memory_update(bool optimize) {
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
-                    // noop
+                    hsa_kt_clear();
                 } break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
@@ -1703,6 +1703,8 @@ void llama_context::set_causal_attn(bool value) {
 void llama_context::set_hsa_params(int32_t skip_layers, int32_t chunk, int32_t r, int32_t topk) {
     LLAMA_LOG_DEBUG("%s: skip = %d chunk = %d r = %d topk = %d\n", __func__, skip_layers, chunk, r, topk);
 
+    synchronize();
+    hsa_kt_clear();
     // llama_decode will build a graph from these parameters
     // we must pass allow_reuse = true, to update the graph in case these params change
     cparams.hsa_skip_layers = std::max(0, skip_layers);
@@ -1728,6 +1730,14 @@ void llama_context::set_hsa_kv_rows(const int32_t * rows, int32_t n_rows) {
 }
 
 void llama_context::hsa_kt_clear() {
+    if (hsa_kt.ctx) {
+        synchronize();
+        for (auto & res : gf_res_prev) {
+            res->reset();
+        }
+        gf_res_prev_active = nullptr;
+        ggml_backend_sched_reset(sched.get());
+    }
     hsa_kt.ready = false;
     hsa_kt.chunk = 0;
     hsa_kt.n_chunks = 0;
@@ -1755,189 +1765,64 @@ void llama_context::hsa_kt_clear() {
 }
 
 bool llama_context::hsa_kt_rebuild() {
+    synchronize();
     hsa_kt_clear();
-
-    if (cparams.hsa_chunk <= 0 || cparams.hsa_topk <= 0 || cparams.hsa_r <= 0) {
-        return false;
+    auto * kv=dynamic_cast<llama_kv_cache *>(memory.get());
+    if(!kv || kv->get_n_stream()!=1 || cparams.hsa_chunk<=0 || cparams.hsa_topk<=0 || cparams.hsa_r<=0) return false;
+    const auto & cells=kv->get_cells(0);
+    const uint32_t extent=cells.used_max_p1();
+    std::vector<int32_t> rows;
+    for(const auto & entry:cells.seq_pos_get(0)) rows.push_back((int32_t)entry.second);
+    if(rows.empty()) return false;
+    const int chunk=cparams.hsa_chunk,D=model.hparams.n_embd_head_k(0),Hkv=model.hparams.n_head_kv(0);
+    // Keep one KV block of headroom and grow bounds as needed.
+    const size_t bound_tokens=std::min<size_t>(kv->get_size(),GGML_PAD(rows.size()+256,256));
+    const int n_layer=model.hparams.n_layer(),capacity=(bound_tokens+chunk-1)/chunk;
+    auto * first=kv->get_k_storage(0);
+    if(!first || (first->type!=GGML_TYPE_F16 && first->type!=GGML_TYPE_F32)) return false;
+    auto * buft=ggml_backend_buffer_get_type(first->buffer);
+    ggml_backend_t backend=nullptr;
+    for(const auto & candidate:backends) if(ggml_backend_get_device(candidate.get())==model.dev_layer(0)) backend=candidate.get();
+    if(!backend) return false;
+    for(int il=0;il<n_layer;++il) {
+        auto * k=kv->get_k_storage(il);
+        if(!k || k->type!=first->type || k->ne[0]!=D*Hkv || ggml_backend_buffer_get_type(k->buffer)!=buft ||
+            model.hparams.n_embd_head_k(il)!=(uint32_t)D || model.hparams.n_head_kv(il)!=(uint32_t)Hkv) return false;
     }
-
-    auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
-    if (!kv) {
-        LLAMA_LOG_WARN("%s: HSA KT requires a standard KV cache\n", __func__);
-        return false;
+    ggml_init_params allocation={ggml_tensor_overhead()*n_layer*2,nullptr,true};
+    hsa_kt.ctx.reset(ggml_init(allocation));
+    if(!hsa_kt.ctx) return false;
+    hsa_kt.k_max.resize(n_layer);hsa_kt.k_min.resize(n_layer);
+    for(int il=0;il<n_layer;++il) {
+        hsa_kt.k_max[il]=ggml_new_tensor_3d(hsa_kt.ctx.get(),first->type,D,capacity,Hkv);
+        hsa_kt.k_min[il]=ggml_new_tensor_3d(hsa_kt.ctx.get(),first->type,D,capacity,Hkv);
     }
-
-    const int chunk = cparams.hsa_chunk;
-    const auto & cells = kv->get_cells(0);
-    const uint32_t n_kv = cells.used_max_p1();
-    if (n_kv == 0) {
-        return false;
+    hsa_kt.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(hsa_kt.ctx.get(),buft));
+    if(!hsa_kt.buf) { hsa_kt_clear();return false; }
+    ggml_init_params scratch_params={4*1024*1024,nullptr,true};
+    ggml_context_ptr scratch(ggml_init(scratch_params));
+    auto * order=ggml_new_tensor_1d(scratch.get(),GGML_TYPE_I32,rows.size());
+    auto * mask=ggml_new_tensor_1d(scratch.get(),GGML_TYPE_F32,extent);
+    auto * graph=ggml_new_graph_custom(scratch.get(),2048,false);
+    for(int il=0;il<n_layer;++il) {
+        auto * store=kv->get_k_storage(il);
+        auto * k=ggml_view_3d(scratch.get(),store,D,Hkv,extent,D*ggml_type_size(store->type),store->nb[1],0);
+        auto * init=ggml_hsa_bounds(scratch.get(),hsa_kt.k_max[il],hsa_kt.k_min[il],k,order,mask,chunk,false);
+        if(!ggml_backend_supports_op(backend,init)) { hsa_kt_clear();return false; }
+        ggml_build_forward_expand(graph,init);
     }
-
-    const int n_chunks = (int) ((n_kv + chunk - 1) / chunk);
-    const int n_layer = model.hparams.n_layer();
-    // Use layer 0 head geometry; HSA path asserts D matches V and GQA.
-    const int D = model.hparams.n_embd_head_k(0);
-    const int Hkv = model.hparams.n_head_kv(0);
-    if (D <= 0 || Hkv <= 0 || n_chunks <= 0) {
-        return false;
-    }
-
-    const size_t n_tensors = (size_t) n_layer * 2;
-    ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * n_tensors,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    hsa_kt.ctx.reset(ggml_init(params));
-    if (!hsa_kt.ctx) {
-        return false;
-    }
-
-    hsa_kt.k_max.resize(n_layer, nullptr);
-    hsa_kt.k_min.resize(n_layer, nullptr);
-    for (int il = 0; il < n_layer; ++il) {
-        hsa_kt.k_max[il] = ggml_new_tensor_3d(hsa_kt.ctx.get(), GGML_TYPE_F32, D, n_chunks, Hkv);
-        hsa_kt.k_min[il] = ggml_new_tensor_3d(hsa_kt.ctx.get(), GGML_TYPE_F32, D, n_chunks, Hkv);
-        ggml_set_name(hsa_kt.k_max[il], ("hsa_k_max-" + std::to_string(il)).c_str());
-        ggml_set_name(hsa_kt.k_min[il], ("hsa_k_min-" + std::to_string(il)).c_str());
-    }
-
-    ggml_backend_dev_t dev = model.dev_layer(0);
-    auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
-    hsa_kt.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(hsa_kt.ctx.get(), buft));
-    if (!hsa_kt.buf) {
-        LLAMA_LOG_WARN("%s: failed to allocate HSA KT buffer\n", __func__);
-        hsa_kt_clear();
-        return false;
-    }
-
-    hsa_kt.k_max_host.assign(n_layer, std::vector<float>((size_t) D * n_chunks * Hkv));
-    hsa_kt.k_min_host.assign(n_layer, std::vector<float>((size_t) D * n_chunks * Hkv));
-    hsa_kt.live.assign(n_kv, 0);
-    for (uint32_t t = 0; t < n_kv; ++t) {
-        hsa_kt.live[t] = cells.is_empty(t) ? 0 : 1;
-    }
-
-    std::vector<uint8_t> k_raw;
-    std::vector<float> k_f32;
-
-    for (int il = 0; il < n_layer; ++il) {
-        std::vector<float> & k_max_host = hsa_kt.k_max_host[il];
-        std::vector<float> & k_min_host = hsa_kt.k_min_host[il];
-        ggml_tensor * k_store = kv->get_k_storage(il);
-        if (!k_store) {
-            hsa_kt_clear();
-            return false;
-        }
-
-        const int64_t n_embd_k_gqa = k_store->ne[0];
-        const int64_t kv_size = k_store->ne[1];
-        GGML_ASSERT(n_embd_k_gqa == (int64_t) D * Hkv);
-        GGML_ASSERT(kv_size >= (int64_t) n_kv);
-
-        const size_t n_elem = (size_t) n_embd_k_gqa * n_kv;
-        k_raw.resize(ggml_row_size(k_store->type, n_embd_k_gqa) * n_kv);
-        ggml_backend_tensor_get(k_store, k_raw.data(), 0, k_raw.size());
-
-        k_f32.resize(n_elem);
-        if (k_store->type == GGML_TYPE_F32) {
-            memcpy(k_f32.data(), k_raw.data(), n_elem * sizeof(float));
-        } else if (k_store->type == GGML_TYPE_F16) {
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) k_raw.data(), k_f32.data(), n_elem);
-        } else if (k_store->type == GGML_TYPE_BF16) {
-            ggml_bf16_to_fp32_row((const ggml_bf16_t *) k_raw.data(), k_f32.data(), n_elem);
-        } else {
-            // Quantized K: dequantize via ggml helper if available; otherwise fail closed.
-            LLAMA_LOG_WARN("%s: unsupported K type %d for HSA KT rebuild\n", __func__, (int) k_store->type);
-            hsa_kt_clear();
-            return false;
-        }
-
-        std::fill(k_max_host.begin(), k_max_host.end(), -INFINITY);
-        std::fill(k_min_host.begin(), k_min_host.end(), +INFINITY);
-
-        for (uint32_t t = 0; t < n_kv; ++t) {
-            if (cells.is_empty(t)) {
-                continue;
-            }
-            const int c = (int) (t / chunk);
-            for (int h = 0; h < Hkv; ++h) {
-                const float * src = k_f32.data() + (size_t) t * n_embd_k_gqa + (size_t) h * D;
-                // KT layout [D, n_chunks, Hkv]: idx = d + c*D + h*D*n_chunks
-                for (int d = 0; d < D; ++d) {
-                    const size_t idx = (size_t) d + (size_t) c * D + (size_t) h * D * n_chunks;
-                    k_max_host[idx] = std::max(k_max_host[idx], src[d]);
-                    k_min_host[idx] = std::min(k_min_host[idx], src[d]);
-                }
-            }
-        }
-
-        // Empty chunks: neutral values so sign*max/min stays well-defined.
-        for (size_t i = 0; i < k_max_host.size(); ++i) {
-            if (!std::isfinite(k_max_host[i])) {
-                k_max_host[i] = 0.0f;
-            }
-            if (!std::isfinite(k_min_host[i])) {
-                k_min_host[i] = 0.0f;
-            }
-        }
-
-        ggml_backend_tensor_set(hsa_kt.k_max[il], k_max_host.data(), 0, k_max_host.size() * sizeof(float));
-        ggml_backend_tensor_set(hsa_kt.k_min[il], k_min_host.data(), 0, k_min_host.size() * sizeof(float));
-
-        // Compact live K + KT for last layer (chunked over live tokens, matches rocket).
-        if (il == n_layer - 1) {
-            hsa_kt.live_cells.clear();
-            hsa_kt.live_cells.reserve(n_kv);
-            for (uint32_t t = 0; t < n_kv; ++t) {
-                if (!cells.is_empty(t)) {
-                    hsa_kt.live_cells.push_back((int32_t) t);
-                }
-            }
-            hsa_kt.n_live = (int) hsa_kt.live_cells.size();
-            hsa_kt.n_chunks_live = (hsa_kt.n_live + chunk - 1) / chunk;
-            hsa_kt.k_live.assign((size_t) Hkv * hsa_kt.n_live * D, 0.0f);
-            hsa_kt.k_max_live.assign((size_t) Hkv * hsa_kt.n_chunks_live * D, -INFINITY);
-            hsa_kt.k_min_live.assign((size_t) Hkv * hsa_kt.n_chunks_live * D, +INFINITY);
-            for (int li = 0; li < hsa_kt.n_live; ++li) {
-                const uint32_t t = (uint32_t) hsa_kt.live_cells[li];
-                const int c = li / chunk;
-                for (int h = 0; h < Hkv; ++h) {
-                    const float * src = k_f32.data() + (size_t) t * n_embd_k_gqa + (size_t) h * D;
-                    float * dst = hsa_kt.k_live.data() + ((size_t) h * hsa_kt.n_live + li) * D;
-                    memcpy(dst, src, (size_t) D * sizeof(float));
-                    for (int d = 0; d < D; ++d) {
-                        const size_t idx = ((size_t) h * hsa_kt.n_chunks_live + c) * D + d;
-                        hsa_kt.k_max_live[idx] = std::max(hsa_kt.k_max_live[idx], src[d]);
-                        hsa_kt.k_min_live[idx] = std::min(hsa_kt.k_min_live[idx], src[d]);
-                    }
-                }
-            }
-            for (size_t i = 0; i < hsa_kt.k_max_live.size(); ++i) {
-                if (!std::isfinite(hsa_kt.k_max_live[i])) hsa_kt.k_max_live[i] = 0.0f;
-                if (!std::isfinite(hsa_kt.k_min_live[i])) hsa_kt.k_min_live[i] = 0.0f;
-            }
-        }
-    }
-
-    hsa_kt.ready = true;
-    hsa_kt.chunk = chunk;
-    hsa_kt.n_chunks = n_chunks;
-    hsa_kt.n_layer = n_layer;
-    hsa_kt.D = D;
-    hsa_kt.Hkv = Hkv;
-    hsa_kt.n_kv = n_kv;
-
-    // Keep device KT pointers available, but decode selection runs on host each step
-    // (flash_attn_ext_rows with uploaded row ids) to stay above full-kv tok/s.
-    cparams.hsa_kt_ready = false;
-    cparams.hsa_n_chunks = n_chunks;
-    cparams.hsa_k_max = hsa_kt.k_max.data();
-    cparams.hsa_k_min = hsa_kt.k_min.data();
-
-    LLAMA_LOG_INFO("%s: HSA KT ready layers=%d chunks=%d D=%d Hkv=%d chunk=%d n_kv=%u (host select)\n",
-            __func__, n_layer, n_chunks, D, Hkv, chunk, n_kv);
+    ggml_backend_buffer_ptr scratch_buffer(ggml_backend_alloc_ctx_tensors(scratch.get(),backend));
+    if(!scratch_buffer) { hsa_kt_clear();return false; }
+    std::vector<float> mask_data(extent,-INFINITY);
+    for(int row:rows) mask_data[row]=0.f;
+    ggml_backend_tensor_set(order,rows.data(),0,rows.size()*sizeof(int32_t));
+    ggml_backend_tensor_set(mask,mask_data.data(),0,mask_data.size()*sizeof(float));
+    if(ggml_backend_graph_compute(backend,graph)!=GGML_STATUS_SUCCESS) { hsa_kt_clear();return false; }
+    hsa_kt.ready=true;hsa_kt.chunk=chunk;hsa_kt.n_chunks=capacity;hsa_kt.n_layer=n_layer;
+    hsa_kt.D=D;hsa_kt.Hkv=Hkv;hsa_kt.n_kv=extent;hsa_kt.n_live=rows.size();
+    hsa_kt.live_cells=std::move(rows);
+    cparams.hsa_kt_ready=true;cparams.hsa_n_chunks=capacity;
+    cparams.hsa_k_max=hsa_kt.k_max.data();cparams.hsa_k_min=hsa_kt.k_min.data();
     return true;
 }
 
@@ -2027,7 +1912,7 @@ bool llama_context::hsa_select_from_q(const float * q_token, int n_head) {
             std::vector<float> probs(n_chunks);
             for (int c = 0; c < n_chunks; ++c) {
                 probs[c] = std::exp(chunk_logits[(size_t) h * n_chunks + c] - max_l);
-                sum_exp += probs[c];
+                sum_exp += probs[c] * std::min(chunk, n_live - c * chunk);
             }
             const float inv = 1.0f / (sum_exp + 1e-9f);
             for (int c = 0; c < n_chunks; ++c) {
@@ -2205,6 +2090,36 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (hsa_kt.ready) {
+        const auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
+        const auto * cache = dynamic_cast<const llama_kv_cache_context *>(mctx);
+        const bool single_append = kv && cache && cache->get_n_kv() > (uint32_t)cparams.hsa_topk &&
+            ubatch.n_tokens == 1 && ubatch.seq_id && ubatch.seq_id[0] &&
+            ubatch.n_seq_id[0] == 1 && ubatch.seq_id[0][0] == 0;
+        bool unchanged_prefix = false;
+        if (single_append) {
+            const auto & positions = kv->get_cells(0).seq_pos_get(0);
+            unchanged_prefix = positions.size() == hsa_kt.live_cells.size() + 1;
+            size_t i = 0;
+            for (auto it = positions.begin(); unchanged_prefix && i < hsa_kt.live_cells.size(); ++it, ++i) {
+                unchanged_prefix = it->second == (uint32_t) hsa_kt.live_cells[i];
+            }
+            if (unchanged_prefix) {
+                hsa_kt.live_cells.push_back((int32_t) positions.rbegin()->second);
+                hsa_kt.n_live = hsa_kt.live_cells.size();
+                if (cache->get_hsa_order_size(ubatch,cparams.causal_attn,cache->get_n_kv()) >
+                    (size_t)hsa_kt.k_max.front()->ne[1]*hsa_kt.chunk) {
+                    // The current key is written later; the decode graph refreshes its final chunk.
+                    hsa_kt_rebuild();
+                }
+            }
+        }
+        // Cached bounds are valid only while decoding one token onto the same prefix.
+        if (!unchanged_prefix) {
+            hsa_kt_clear();
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -4488,6 +4403,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 }
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
+    hsa_kt_clear();
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
 
     // read model info
@@ -4522,6 +4438,7 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    hsa_kt_clear();
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }

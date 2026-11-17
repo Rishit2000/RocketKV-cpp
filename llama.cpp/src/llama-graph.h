@@ -131,6 +131,18 @@ protected:
 
 using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
+class llm_graph_input_hsa_order : public llm_graph_input_i {
+public:
+    llm_graph_input_hsa_order(const llama_kv_cache_context * mctx, bool causal, uint32_t extent) : mctx(mctx), causal(causal), extent(extent) {}
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    ggml_tensor * order = nullptr;
+private:
+    const llama_kv_cache_context * mctx;
+    bool causal;
+    uint32_t extent;
+};
+
 // Host-selected HSA K/V row list for ggml_flash_attn_ext_rows
 class llm_graph_input_hsa_rows : public llm_graph_input_i {
 public:

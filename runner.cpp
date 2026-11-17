@@ -177,7 +177,8 @@ static InferenceOutput run_inference(
     int hsa_skip_layers,
     int context_len_limit,
     float bytes_per_elem,
-    bool stream_stdout
+    bool stream_stdout,
+    bool ignore_eos
 ) {
     // Strict Isolation: ensure cache and activation buffers are completely clean
     llama_memory_t mem = llama_get_memory(ctx);
@@ -223,7 +224,7 @@ static InferenceOutput run_inference(
         config.r_dim = 0;
     }
 
-    // Stage 2 (HSA): host one-shot selection + flash_attn_ext_rows decode graph.
+    // Stage 2 scores each layer's current query against the live KV cache.
     // Enable with --hsa 1 or ROCKET_HSA=1. Optional ROCKET_HSA_SKIP=N skips the first N layers.
     if (enable_rocket && enable_hsa && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
         int skip = hsa_skip_layers;
@@ -304,55 +305,14 @@ static InferenceOutput run_inference(
             llama_memory_seq_rm(mem, 0, range_start, n_tokens);
         }
 
-        // Stage-2 HSA: rebuild KT, then select rows from the last prompt Q.
-        if (enable_hsa && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
-            llama_set_hsa_kv_rows(ctx, nullptr, 0);
-            if (!llama_hsa_kt_rebuild(ctx)) {
-                std::cerr << "Warning: HSA KT rebuild failed; decode will use fallback rows\n";
-            } else if (!g_acts.q.empty() && !g_acts.k.empty()) {
-                // Initial rows from full-K HSA on kept tokens (matches PyTorch); later steps use KT.
-                const int n_kept = (int) kept_indices.size();
-                std::vector<float> q_tok(config.num_heads * config.dim_head, 0.0f);
-                for (int h = 0; h < config.num_heads; ++h) {
-                    const float * src = g_acts.q.data() + (h * n_tokens + (n_tokens - 1)) * config.dim_head;
-                    std::memcpy(q_tok.data() + h * config.dim_head, src, config.dim_head * sizeof(float));
-                }
-                std::vector<float> k_kept(config.num_heads_kv * n_kept * config.dim_head, 0.0f);
-                for (int h = 0; h < config.num_heads_kv; ++h) {
-                    for (int i = 0; i < n_kept; ++i) {
-                        const int src_t = kept_indices[i];
-                        const float * src = g_acts.k.data() + (h * n_tokens + src_t) * config.dim_head;
-                        float * dst = k_kept.data() + (h * n_kept + i) * config.dim_head;
-                        std::memcpy(dst, src, config.dim_head * sizeof(float));
-                    }
-                }
-                std::vector<int> local = compute_hsa_indices(q_tok.data(), k_kept.data(), n_kept, config);
-                std::vector<int32_t> rows;
-                rows.reserve(local.size());
-                for (int li : local) {
-                    if (li >= 0 && li < n_kept) rows.push_back((int32_t) kept_indices[li]);
-                }
-                llama_set_hsa_kv_rows(ctx, rows.data(), (int32_t) rows.size());
-            }
-        }
-
         int64_t t_evict_end = ggml_time_us();
         evict_ms = (t_evict_end - t_evict_start) / 1000.0;
-    } else if (enable_rocket && enable_hsa && config.chunk_size > 0 && config.r_dim > 0
-            && config.topk_decode > 0) {
-        llama_set_hsa_kv_rows(ctx, nullptr, 0);
-        if (!llama_hsa_kt_rebuild(ctx)) {
-            std::cerr << "Warning: HSA KT rebuild failed; decode will use fallback rows\n";
-        } else if (!g_acts.q.empty() && !g_acts.k.empty()) {
-            std::vector<float> q_tok(config.num_heads * config.dim_head, 0.0f);
-            for (int h = 0; h < config.num_heads; ++h) {
-                const float * src = g_acts.q.data() + (h * n_tokens + (n_tokens - 1)) * config.dim_head;
-                std::memcpy(q_tok.data() + h * config.dim_head, src, config.dim_head * sizeof(float));
-            }
-            std::vector<int> local = compute_hsa_indices(q_tok.data(), g_acts.k.data(), n_tokens, config);
-            std::vector<int32_t> rows(local.begin(), local.end());
-            llama_set_hsa_kv_rows(ctx, rows.data(), (int32_t) rows.size());
-        }
+    }
+
+    if(enable_rocket && enable_hsa && config.chunk_size>0 && config.r_dim>0 && config.topk_decode>0) {
+        const int64_t start=ggml_time_us();
+        llama_hsa_kt_rebuild(ctx);
+        evict_ms+=(ggml_time_us()-start)/1000.0;
     }
 
     // Release prefill activation buffers
@@ -371,7 +331,7 @@ static InferenceOutput run_inference(
     // Sample the initial token generated from the prefill prompt
     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
-    // Per-step HSA reselect runs inside llama_decode (in-graph Q capture, no eval callback).
+    // Per-step HSA selection runs inside the decode graph.
     g_decode_q_enabled = false;
     g_decode_q_tensor = nullptr;
     g_acts.enabled = false;
@@ -379,7 +339,7 @@ static InferenceOutput run_inference(
     int64_t t_start_decode = ggml_time_us();
 
     while (n_cur < ctx_params.n_ctx && n_decode_steps < max_tokens) {
-        if (llama_vocab_is_eog(vocab, new_token_id)) break;
+        if (!ignore_eos && llama_vocab_is_eog(vocab, new_token_id)) break;
 
         char piece_buf[256];
         int n_piece = llama_token_to_piece(vocab, new_token_id, piece_buf, sizeof(piece_buf), 0, true);
@@ -493,6 +453,7 @@ int main(int argc, char ** argv) {
     int max_tokens = 128;
     int token_budget = 1024;
     bool enable_rocket = true;
+    bool ignore_eos = false;
     int n_ctx_override = 9216;
     int context_len_limit = 0;
     int window_size = 32;
@@ -511,6 +472,7 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) model_path = argv[++i];
+        else if (arg == "--ignore-eos") ignore_eos = true;
         else if (arg == "--kv-type" && i + 1 < argc) kv_type_str = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) max_tokens = safe_stoi(argv[++i], max_tokens);
         else if ((arg == "--budget" || arg == "--token-budget") && i + 1 < argc) token_budget = safe_stoi(argv[++i], token_budget);
@@ -616,13 +578,14 @@ int main(int argc, char ** argv) {
             InferenceOutput res = run_inference(
                 ctx, model, vocab, ctx_params, config, prompt,
                 req_max_tokens, token_budget, enable_rocket, enable_hsa, hsa_skip_layers,
-                context_len_limit, bytes_per_elem, false
+                context_len_limit, bytes_per_elem, false, ignore_eos
             );
 
             nlohmann::json item_out;
             item_out["sample_id"] = item.value("sample_id", i + 1);
             item_out["generated"] = res.text;
             item_out["metrics"] = metrics_to_json(res, kv_type_str, enable_rocket, token_budget);
+            item_out["metrics"]["ignore_eos"] = ignore_eos;
             out_data.push_back(item_out);
 
             std::cerr << "    [" << (i + 1) << "/" << total << "] TTFT: "
