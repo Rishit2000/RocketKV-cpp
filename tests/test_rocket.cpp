@@ -151,7 +151,7 @@ static void test_sparse_contract() {
 
 static void test_prefill_key_tails() {
     for (int dim : {1, 7, 128}) {
-        for (int prefix : {1, 2, 3, 4, 5, 7, 8, 9, 17}) {
+        for (int prefix : {1, 2, 3, 4, 5, 7, 8, 9, 17, 31, 32, 33, 63, 64, 65}) {
             RocketConfig cfg{};
             cfg.num_heads = 4;
             cfg.num_heads_kv = 2;
