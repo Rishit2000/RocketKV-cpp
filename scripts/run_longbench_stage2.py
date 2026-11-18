@@ -35,14 +35,18 @@ def main():
     parser.add_argument("--config", default="configs/longbench.json")
     parser.add_argument("--budget", type=int, default=1024)
     parser.add_argument("--threads", type=int, default=16)
+    parser.add_argument("--stage1-backend", choices=("cpu", "metal"), default="cpu",
+                        help="Stage 1 scoring backend for stage1 and hsa runs")
+    parser.add_argument("--mode", choices=("all", *MODES), default="all")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     os.chdir(ROOT)
     config = load_config_file(args.config)
     tasks = config["benchmark"]["tasks"]
     count = config["benchmark"]["num_samples"]
-    if not isinstance(tasks, list) or len(set(tasks)) != len(tasks) or count < 1:
-        raise ValueError("Use an explicit task list and a positive sample count")
+    modes = MODES if args.mode == "all" else (args.mode,)
+    if not isinstance(tasks, list) or not tasks or len(set(tasks)) != len(tasks) or (count != -1 and count < 1):
+        raise ValueError("Use an explicit task list and a positive sample count or -1 for all samples")
     if args.budget < 1 or args.threads < 1:
         raise ValueError("Budget and thread count must be positive")
     # Require the scoring libraries rather than silently using fallback metrics.
@@ -60,7 +64,7 @@ def main():
     samples = {}
     for task in tasks:
         samples[task] = load_longbench_dataset(task, count, data_dir=config["management"]["data_dir"])
-        if len(samples[task]) != count:
+        if not samples[task] or (count != -1 and len(samples[task]) != count):
             raise ValueError(f"{task}: expected {count} samples, found {len(samples[task])}")
     manifest = {
         "model": str(model), "model_size": model.stat().st_size, "model_mtime_ns": model.stat().st_mtime_ns,
@@ -68,7 +72,8 @@ def main():
         "scoring_sha256": hashlib.sha256((ROOT / "eval_suite/metrics.py").read_bytes()).hexdigest(),
         "runner": str(runner), "runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "tasks": tasks, "samples_per_task": count, "modes": MODES,
+        "tasks": tasks, "samples_per_task": {task: len(rows) for task, rows in samples.items()}, "modes": modes,
+        "stage1_backend": args.stage1_backend, "hsa_backend": "metal",
         "budget": args.budget, "threads": args.threads, "gpu_layers": 99, "kv_type": "f16",
         "n_ctx": config["model"]["n_ctx"], "context_len": config["benchmark"]["context_len"],
         "window_size": config["attention"].get("window_size", 32),
@@ -86,14 +91,14 @@ def main():
         raise ValueError("Existing experiment has different inputs, binary, or settings; use a new output directory")
     save(manifest_path, manifest)
     save(output / "samples.json", samples)
-    total = len(tasks) * count * len(MODES)
+    total = sum(len(rows) for rows in samples.values()) * len(modes)
     completed = 0
     summary = {}
     started = time.time()
     status = {"state": "running", "pid": os.getpid(), "started_at": started, "completed": 0, "total": total}
     save(output / "status.json", status)
     try:
-        for mode in MODES:
+        for mode in modes:
             summary[mode] = {}
             for task in tasks:
                 directory = output / mode / task
@@ -116,6 +121,8 @@ def main():
                                    "--budget", str(args.budget), "--n-ctx", str(manifest["n_ctx"]),
                                    "--context-len", str(manifest["context_len"]),
                                    "--window-size", str(manifest["window_size"]), "--kernel-size", str(manifest["kernel_size"])]
+                        if mode != "off":
+                            command.extend(["--stage1-backend", args.stage1_backend])
                         begin = time.monotonic()
                         with (directory / f"{key}.log").open("w") as log:
                             subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=1800)
@@ -127,6 +134,14 @@ def main():
                         m = record["metrics"]
                         if m["effective_mode"] != mode:
                             raise RuntimeError("Runner used the wrong mode")
+                        if mode != "off" and args.stage1_backend == "metal":
+                            if m["requested_stage1_backend"] != "metal":
+                                raise RuntimeError("Runner did not accept Metal Stage 1")
+                            if m["kept_tokens"] < m["prompt_tokens"] and (
+                                m["stage1_backend"] != "metal" or m["stage1_capture"] != "metal"
+                                or m["stage1_capture_metal_calls"] < 1 or m["stage1_capture_host_bytes"] != 0
+                            ):
+                                raise RuntimeError("Stage 1 eviction did not use GPU-resident Metal capture and scoring")
                         if mode == "hsa" and (m["stage2_backend"] != "metal" or m["model_backend"] != "metal" or
                                               m["stage2_layer_calls"] != m["model_layers"] * m["decode_forward_calls"]):
                             raise RuntimeError("Metal HSA did not execute in every layer")
