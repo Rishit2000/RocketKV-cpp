@@ -301,6 +301,207 @@ void compare_native(RocketMetal &metal, ggml_backend_t backend) {
     std::cout << "Native Metal graph dependencies, reuse and mask validation passed\n";
 }
 
+void compare_prefill(RocketMetal &metal, int dim, int prefix, int window, int kernel, bool zero = false) {
+    RocketConfig cfg{};
+    cfg.num_heads = 6;
+    cfg.num_heads_kv = 2;
+    cfg.dim_head = dim;
+    cfg.window_size = window;
+    cfg.kernel_size = kernel;
+    cfg.prompt_budget = window + prefix / 2;
+    const int len_k = prefix + window, len_q = window + 2;
+    std::mt19937 rng(173 + prefix + dim);
+    std::uniform_real_distribution<float> random(-1, 1);
+    std::vector<float> q(size_t(cfg.num_heads) * len_q * dim);
+    std::vector<float> k(size_t(cfg.num_heads_kv) * len_k * dim);
+    for (auto &x : q) x = zero ? 0.0f : random(rng);
+    for (auto &x : k) x = random(rng);
+    std::vector<float> cpu_scores, gpu_scores;
+    const auto cpu = compute_prefill_eviction(q.data(), k.data(), len_q, len_k, cfg, &cpu_scores);
+    const auto gpu = metal.prefill(q.data(), k.data(), len_q, len_k, cfg, &gpu_scores);
+    check(cpu_scores.size() == gpu_scores.size(), "Stage 1 score shape mismatch");
+    for (size_t i = 0; i < cpu_scores.size(); ++i) {
+        check(std::isfinite(gpu_scores[i]) &&
+              std::abs(cpu_scores[i] - gpu_scores[i]) <= 1e-5f + 1e-4f * std::abs(cpu_scores[i]),
+              "Stage 1 CPU/Metal importance mismatch");
+    }
+    check(cpu == gpu, "Stage 1 CPU/Metal survivors differ");
+    check(gpu.size() == size_t(cfg.prompt_budget), "Stage 1 budget mismatch");
+    for (int i = 0; i < window; ++i) {
+        check(gpu[gpu.size() - window + i] == prefix + i, "Stage 1 lost observation token");
+    }
+    // Reuse the same buffers after changing the query and budget.
+    std::fill(q.begin(), q.end(), 0.0f);
+    cfg.prompt_budget = window;
+    check(metal.prefill(q.data(), k.data(), len_q, len_k, cfg) ==
+          compute_prefill_eviction(q.data(), k.data(), len_q, len_k, cfg),
+          "Stage 1 observation-only selection mismatch");
+    cfg.prompt_budget = len_k + 1;
+    check(metal.prefill(nullptr, nullptr, len_q, len_k, cfg, &gpu_scores) ==
+          compute_prefill_eviction(nullptr, nullptr, len_q, len_k, cfg),
+          "Stage 1 no-eviction path mismatch");
+    check(gpu_scores.empty(), "Stage 1 skipped request left stale scores");
+}
+
+void test_prefill_errors(RocketMetal &metal) {
+    RocketConfig cfg{};
+    cfg.num_heads = 2;
+    cfg.num_heads_kv = 1;
+    cfg.dim_head = 3;
+    cfg.window_size = 2;
+    cfg.kernel_size = 3;
+    cfg.prompt_budget = 3;
+    std::vector<float> q(30, 0.1f), k(15, 0.2f);
+    auto invalid = [&](const float *qp, const float *kp, int nq, int nk) {
+        bool failed = false;
+        try {
+            metal.prefill(qp, kp, nq, nk, cfg);
+        } catch (const std::invalid_argument &) {
+            failed = true;
+        }
+        check(failed, "Invalid Stage 1 input accepted");
+    };
+    invalid(nullptr, k.data(), 5, 5);
+    invalid(q.data(), nullptr, 5, 5);
+    invalid(q.data(), k.data(), 0, 5);
+    cfg.num_heads_kv = 3;
+    invalid(q.data(), k.data(), 5, 5);
+    cfg.num_heads_kv = 1;
+    cfg.prompt_budget = 1;
+    invalid(q.data(), k.data(), 5, 5);
+    cfg.prompt_budget = 3;
+    q[0] = std::numeric_limits<float>::quiet_NaN();
+    invalid(q.data(), k.data(), 5, 5);
+    q[0] = 0.1f;
+    k.back() = std::numeric_limits<float>::infinity();
+    invalid(q.data(), k.data(), 5, 5);
+    std::fill(q.begin(), q.end(), 1e30f);
+    std::fill(k.begin(), k.end(), 1e30f);
+    bool failed = false;
+    try {
+        metal.prefill(q.data(), k.data(), 5, 5, cfg);
+    } catch (const std::runtime_error &) {
+        failed = true;
+    }
+    check(failed, "Overflowing Stage 1 dot product accepted");
+    std::fill(q.begin(), q.end(), 0.1f);
+    std::fill(k.begin(), k.end(), 0.2f);
+    check(metal.prefill(q.data(), k.data(), 5, 5, cfg).size() == 3,
+          "Stage 1 failed to recover after an error");
+}
+
+void compare_prefill_capture(RocketMetal &metal, ggml_backend_t backend, ggml_type type, bool direct) {
+    RocketConfig cfg{};
+    cfg.num_heads = 6;
+    cfg.num_heads_kv = 2;
+    cfg.dim_head = 7;
+    cfg.window_size = 9;
+    cfg.kernel_size = 3;
+    cfg.prompt_budget = 19;
+    const int nq = 23, nk = 37, batch = 8;
+    ggml_init_params params{1024 * 1024, nullptr, true};
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+    check(bool(ctx), "Capture tensor allocation failed");
+    auto *qs = ggml_new_tensor_3d(ctx.get(), type, cfg.dim_head * 2, cfg.num_heads, batch + 2);
+    auto *ks = ggml_new_tensor_3d(ctx.get(), type, cfg.dim_head * 2, cfg.num_heads_kv, batch + 2);
+    const size_t element = ggml_type_size(type);
+    auto make_view = [&](ggml_tensor *storage) {
+        auto *view = ggml_view_3d(ctx.get(), storage, cfg.dim_head, storage->ne[1], batch,
+                                  storage->nb[1], storage->nb[2], storage->nb[2] + element);
+        view->nb[0] *= 2;
+        return view;
+    };
+    auto *qv = make_view(qs), *kv = make_view(ks);
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
+        ggml_backend_alloc_ctx_tensors(ctx.get(), backend), ggml_backend_buffer_free);
+    check(bool(buffer), "Capture backend allocation failed");
+    check(metal.can_bind(qv) == direct, "Unexpected capture binding route");
+    std::mt19937 rng(173);
+    std::uniform_int_distribution<int> random(-16, 16);
+    std::vector<float> q(size_t(cfg.num_heads) * nq * cfg.dim_head);
+    std::vector<float> k(size_t(cfg.num_heads_kv) * nk * cfg.dim_head);
+    auto upload = [&](ggml_tensor *storage, ggml_tensor *view, const std::vector<float> &values, int total, int offset) {
+        std::vector<unsigned char> raw(ggml_nbytes(storage), 0);
+        view->ne[2] = std::min(batch, total - offset);
+        for (int t = 0; t < view->ne[2]; ++t) {
+            for (int h = 0; h < view->ne[1]; ++h) {
+                for (int d = 0; d < cfg.dim_head; ++d) {
+                    float x = values[(size_t(h) * total + offset + t) * cfg.dim_head + d];
+                    auto *dst = raw.data() + storage->nb[2] + element +
+                                t * view->nb[2] + h * view->nb[1] + d * view->nb[0];
+                    if (type == GGML_TYPE_F32) std::memcpy(dst, &x, sizeof(x));
+                    else if (type == GGML_TYPE_F16) {
+                        const auto v = ggml_fp32_to_fp16(x);
+                        std::memcpy(dst, &v, sizeof(v));
+                    } else {
+                        const auto v = ggml_fp32_to_bf16(x);
+                        std::memcpy(dst, &v, sizeof(v));
+                    }
+                }
+            }
+        }
+        ggml_backend_tensor_set(storage, raw.data(), 0, raw.size());
+        ggml_backend_synchronize(backend);
+    };
+    // Validate even discarded Q positions, and recover by starting a new request.
+    q[0] = std::numeric_limits<float>::quiet_NaN();
+    upload(qs, qv, q, nq, 0);
+    metal.begin_prefill(nq, nk, cfg);
+    bool failed = false;
+    try { metal.capture_prefill(qv, true, 0); }
+    catch (const std::runtime_error &) { failed = true; }
+    check(failed, "Non-finite discarded query accepted");
+    for (int request = 0; request < 2; ++request) {
+        for (auto &x : q) x = float(random(rng)) / 16;
+        for (auto &x : k) x = float(random(rng)) / 16;
+        if (request) {
+            cfg.window_size = 3;
+            cfg.prompt_budget = 7;
+        }
+        metal.begin_prefill(nq, nk, cfg);
+        failed = false;
+        try { metal.finish_prefill(); }
+        catch (const std::runtime_error &) { failed = true; }
+        check(failed, "Incomplete capture accepted");
+        upload(qs, qv, q, nq, 0);
+        failed = false;
+        try { metal.capture_prefill(qv, true, 1); }
+        catch (const std::invalid_argument &) { failed = true; }
+        check(failed, "Out-of-order capture accepted");
+        for (int offset = 0; offset < nk; offset += batch) {
+            if (offset < nq) {
+                upload(qs, qv, q, nq, offset);
+                metal.capture_prefill(qv, true, offset);
+                ggml_backend_tensor_memset(qs, 0, 0, ggml_nbytes(qs));
+            }
+            upload(ks, kv, k, nk, offset);
+            metal.capture_prefill(kv, false, offset);
+            ggml_backend_tensor_memset(ks, 0, 0, ggml_nbytes(ks));
+        }
+        std::vector<float> captured_scores, host_scores;
+        const auto actual = metal.finish_prefill(&captured_scores);
+        const auto stats = metal.capture_stats();
+        check(stats.metal_calls == (direct ? 8 : 0) && stats.host_calls == (direct ? 0 : 8),
+              "Capture route statistics incorrect");
+        check(direct ? stats.host_bytes == 0 : stats.host_bytes > 0, "Capture host-byte accounting incorrect");
+        failed = false;
+        try { metal.finish_prefill(); }
+        catch (const std::runtime_error &) { failed = true; }
+        check(failed, "Completed capture was reused");
+        const auto expected = metal.prefill(q.data(), k.data(), nq, nk, cfg, &host_scores);
+        check(captured_scores == host_scores && actual == expected, "Resident/host capture scores differ");
+        check(actual == compute_prefill_eviction(q.data(), k.data(), nq, nk, cfg),
+              "Resident/CPU selection differs");
+    }
+    metal.reset();
+    failed = false;
+    try { metal.capture_prefill(qv, true, 0); }
+    catch (const std::invalid_argument &) { failed = true; }
+    check(failed, "Capture after reset accepted");
+    std::cout << "Prefill strided capture, source reuse and reset passed (direct=" << direct
+              << ", type=" << ggml_type_name(type) << ")\n";
+}
+
 int main() {
     try {
         ggml_backend_load_all();
@@ -309,6 +510,25 @@ int main() {
             reg ? ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, 0), nullptr) : nullptr, ggml_backend_free);
         check(!reg || bool(backend), "Metal backend initialization failed");
         RocketMetal metal;
+        std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(
+            ggml_backend_init_by_name("CPU", nullptr), ggml_backend_free);
+        check(bool(cpu), "CPU backend initialization failed");
+        for (auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+            compare_prefill_capture(metal, cpu.get(), type, false);
+            if (backend) compare_prefill_capture(metal, backend.get(), type, true);
+        }
+        for (int dim : {1, 7, 128}) {
+            for (int prefix : {1, 2, 3, 4, 31, 32, 33, 255, 256, 257, 513}) {
+                compare_prefill(metal, dim, prefix, 3, 1);
+            }
+        }
+        for (int count : {2048, 4096, 8192}) compare_prefill(metal, 128, count - 32, 32, 63);
+        compare_prefill(metal, 7, 33, 3, 63);
+        compare_prefill(metal, 7, 33, 3, 63, true);
+        test_prefill_errors(metal);
+        metal.reset();
+        compare_prefill(metal, 7, 33, 3, 3);
+        std::cout << "Stage 1 CPU/Metal scoring, selection, reuse and validation passed\n";
         compare(metal, 1, 17, 3, 7);
         compare(metal, 31, 33, 1, 17);
         compare(metal, 33, 35, 4, 10);

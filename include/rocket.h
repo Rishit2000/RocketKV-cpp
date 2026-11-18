@@ -43,7 +43,14 @@ RocketBudgetParams compute_rocket_params(
 std::vector<int> compute_prefill_eviction(
     const float* Q, const float* K, 
     int len_q, int len_k, 
-    const RocketConfig& cfg);
+    const RocketConfig& cfg, std::vector<float>* importance = nullptr);
+
+// Shared by the CPU and Metal prefill paths. No tensor access when all tokens fit.
+void validate_prefill_config(int len_q, int len_k, const RocketConfig& cfg);
+void validate_prefill_inputs(const float* Q, const float* K, int len_q, int len_k,
+                             const RocketConfig& cfg);
+std::vector<int> select_prefill_tokens(const std::vector<float>& importance,
+                                     int observation_size, int prompt_budget);
 
 std::vector<float> compute_hybrid_sparse_decode(
     const float* Q, const float* K, const float* V,

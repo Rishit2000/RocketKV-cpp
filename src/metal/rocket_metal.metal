@@ -137,11 +137,7 @@ kernel void approximate(ARGS, uint i [[thread_position_in_grid]]) {
     chunks[i] = scales[h] > 0 ? dot / scales[h] : 0;
 }
 
-// Used for both approximate chunk probabilities and exact selected-token probabilities.
-kernel void softmax(ARGS, constant uint &width [[buffer(16)]], constant uint &exact_mode [[buffer(17)]],
-                    uint tid [[thread_index_in_threadgroup]], uint h [[threadgroup_position_in_grid]]) {
-    threadgroup float scratch[256];
-    device float *row = (exact_mode ? exact : chunks) + h * width;
+inline void normalize_row(device float *row, uint width, uint tid, threadgroup float *scratch) {
     float m = -INFINITY;
     for (uint i = tid; i < width; i += 256) {
         m = max(m, row[i]);
@@ -174,6 +170,95 @@ kernel void softmax(ARGS, constant uint &width [[buffer(16)]], constant uint &ex
     for (uint i = tid; i < width; i += 256) {
         row[i] *= inverse;
     }
+}
+
+// Shared by decode attention and prefill scoring.
+kernel void softmax(ARGS, constant uint &width [[buffer(16)]], constant uint &exact_mode [[buffer(17)]],
+                    uint tid [[thread_index_in_threadgroup]], uint h [[threadgroup_position_in_grid]]) {
+    threadgroup float scratch[256];
+    normalize_row((exact_mode ? exact : chunks) + h * width, width, tid, scratch);
+}
+
+struct PrefillParams {
+    uint dim, heads, kv_heads, len_k, obs, count, pad;
+    float scale;
+};
+#define PREFILL_ARGS \
+    constant PrefillParams &p [[buffer(0)]], device const float *q [[buffer(1)]], \
+    device const float *k [[buffer(2)]], device float *packed [[buffer(3)]], \
+    device float *logits [[buffer(4)]], device float *groups [[buffer(5)]], \
+    device float *scores [[buffer(6)]], device atomic_uint *error [[buffer(7)]]
+
+struct CaptureParams {
+    uint heads, tokens, offset, total, sd, sh, st, type, is_query;
+};
+
+kernel void prefill_capture(constant PrefillParams &p [[buffer(0)]], device float *q [[buffer(1)]],
+                           device float *packed [[buffer(3)]], device atomic_uint *error [[buffer(7)]],
+                           device const uchar *raw [[buffer(8)]], constant CaptureParams &c [[buffer(9)]],
+                           uint i [[thread_position_in_grid]]) {
+    if (i >= c.tokens * c.heads * p.dim) return;
+    uint d = i % p.dim, h = (i / p.dim) % c.heads, t = i / (p.dim * c.heads);
+    device const uchar *src = raw + d * c.sd + h * c.sh + t * c.st;
+    float value = c.type == 0 ? *reinterpret_cast<device const float *>(src)
+                : c.type == 1 ? float(*reinterpret_cast<device const half *>(src))
+                              : as_type<float>(uint(*reinterpret_cast<device const ushort *>(src)) << 16);
+    if (!isfinite(value)) atomic_store_explicit(error, 1u, memory_order_relaxed);
+    uint pos = c.offset + t;
+    if (c.is_query) {
+        if (pos >= c.total - p.obs) q[(h * p.obs + pos - (c.total - p.obs)) * p.dim + d] = value;
+    } else if (pos < p.count) {
+        packed[(h * p.dim + d) * p.count + pos] = value;
+    }
+}
+
+kernel void prefill_pack(PREFILL_ARGS, uint i [[thread_position_in_grid]]) {
+    if (i >= p.kv_heads * p.count * p.dim) return;
+    uint t = i % p.count, d = (i / p.count) % p.dim, h = i / (p.count * p.dim);
+    packed[i] = k[(h * p.len_k + t) * p.dim + d];
+}
+
+kernel void prefill_dot(PREFILL_ARGS, uint i [[thread_position_in_grid]]) {
+    if (i >= p.heads * p.obs * p.count) return;
+    uint t = i % p.count, row = i / p.count;
+    uint group = (row / p.obs) / (p.heads / p.kv_heads);
+    float dot = 0;
+    for (uint d = 0; d < p.dim; ++d) {
+        dot += q[row * p.dim + d] * packed[(group * p.dim + d) * p.count + t];
+    }
+    logits[i] = dot * p.scale;
+    if (!isfinite(logits[i])) atomic_store_explicit(error, 1u, memory_order_relaxed);
+}
+
+kernel void prefill_softmax(PREFILL_ARGS, uint tid [[thread_index_in_threadgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float scratch[256];
+    normalize_row(logits + row * p.count, p.count, tid, scratch);
+}
+
+kernel void prefill_reduce(PREFILL_ARGS, uint i [[thread_position_in_grid]]) {
+    if (i >= p.kv_heads * p.count) return;
+    uint group = i / p.count, t = i % p.count;
+    uint rows = p.heads / p.kv_heads * p.obs;
+    float sum = 0;
+    for (uint row = group * rows; row < (group + 1) * rows; ++row) {
+        sum += logits[row * p.count + t];
+    }
+    groups[i] = sum;
+    if (!isfinite(sum)) atomic_store_explicit(error, 1u, memory_order_relaxed);
+}
+
+kernel void prefill_pool(PREFILL_ARGS, uint t [[thread_position_in_grid]]) {
+    if (t >= p.count) return;
+    float sum = 0;
+    for (uint h = 0; h < p.kv_heads; ++h) {
+        float pooled = -INFINITY;
+        uint start = t > p.pad ? t - p.pad : 0;
+        uint end = t + min(p.pad, p.count - 1 - t);
+        for (uint j = start; j <= end; ++j) pooled = max(pooled, groups[h * p.count + j]);
+        sum += pooled;
+    }
+    scores[t] = sum;
 }
 
 inline uint selection_prefix(uint value, threadgroup uint *scratch, uint tid, uint width) {

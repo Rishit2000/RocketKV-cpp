@@ -203,6 +203,7 @@ class Stage2IntegrationTests(unittest.TestCase):
         cases = [
             (["--kv-type", "q8_0"], "requires F16"),
             (["--stage2-backend", "unknown"], "Unknown stage2 backend"),
+            (["--stage1-backend", "unknown"], "Unknown stage1 backend"),
             (["--rocket", "1"], "Do not combine"),
             (["--budget", "0"], "requires F16"),
             (["--n-ctx", "8", "--context-len", "0"], "exceeds --n-ctx"),
@@ -214,6 +215,62 @@ class Stage2IntegrationTests(unittest.TestCase):
                 self.run_batch([sample], extra=options, error=message)
         self.run_batch([dict(sample, max_tokens=0)], error="Invalid generation length")
         self.run_batch([dict(sample, forced_tokens=[-1, 10])], error="Invalid or EOG forced token")
+        self.run_batch([sample], "off", ["--stage1-backend", "metal"],
+                       error="Metal stage1 backend requires")
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on macOS")
+    def test_metal_stage1_matches_cpu_and_skips_short_prompts(self):
+        samples = [self.sample(tokens=FORCED[:3]),
+                   self.sample(prompt="", tokens=FORCED[:3], sample_id=2)]
+        for mode, extra in [
+            ("stage1", []),
+            ("hsa", ["--stage2-backend", "metal", "--gpu-layers", "99"]),
+        ]:
+            with self.subTest(mode=mode):
+                options = extra + ["--ubatch", "8"]
+                cpu = self.run_batch(samples, mode, options)
+                gpu = self.run_batch(samples, mode, options + ["--stage1-backend", "metal"])
+                for a, b in zip(cpu, gpu):
+                    self.assertEqual(a["kept_positions"], b["kept_positions"])
+                    self.assert_close(a["logits"], b["logits"], 2e-4)
+                    self.assert_close(a["attention"], b["attention"], 2e-4)
+                    self.assertEqual(a["token_ids"], b["token_ids"])
+                    self.assertEqual(b["metrics"]["requested_stage1_backend"], "metal")
+                self.assertEqual(cpu[0]["metrics"]["stage1_backend"], "cpu")
+                self.assertEqual(gpu[0]["metrics"]["stage1_backend"], "metal")
+                metrics = gpu[0]["metrics"]
+                if mode == "hsa":
+                    self.assertEqual(metrics["stage1_capture"], "metal")
+                    self.assertEqual(metrics["stage1_capture_host_bytes"], 0)
+                    self.assertGreater(metrics["stage1_capture_metal_calls"], 0)
+                else:
+                    self.assertEqual(metrics["stage1_capture"], "host")
+                    self.assertGreater(metrics["stage1_capture_host_bytes"], 0)
+                    self.assertEqual(metrics["stage1_capture_metal_calls"], 0)
+                self.assertEqual(gpu[1]["metrics"]["stage1_backend"], "none")
+                self.assertEqual(gpu[1]["metrics"]["stage1_capture"], "none")
+                self.assertEqual(gpu[1]["metrics"]["stage1_capture_host_bytes"], 0)
+                alone = self.run_batch([samples[0]], mode, options + ["--stage1-backend", "metal"])[0]
+                self.assertEqual(alone["kept_positions"], gpu[0]["kept_positions"])
+                self.assert_close(alone["logits"], gpu[0]["logits"], 2e-4)
+
+    @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on macOS")
+    def test_resident_capture_spans_microbatches_and_request_reset(self):
+        samples = [self.sample(tokens=FORCED[:3]),
+                   self.sample(prompt="A little bird.", tokens=FORCED[:1], sample_id=2),
+                   self.sample(prompt=PROMPT[::-1], tokens=FORCED[:3], sample_id=3)]
+        options = ["--gpu-layers", "99", "--ubatch", "8", "--context-len", "65", "--window-size", "17"]
+        cpu = self.run_batch(samples, "stage1", options)
+        gpu = self.run_batch(samples, "stage1", options + ["--stage1-backend", "metal"])
+        for a, b in zip(cpu, gpu):
+            self.assertEqual(a["kept_positions"], b["kept_positions"])
+            self.assert_close(a["logits"], b["logits"], 2e-4)
+            self.assert_close(a["attention"], b["attention"], 2e-4)
+            self.assertEqual(b["metrics"]["stage1_capture_host_bytes"], 0)
+        self.assertEqual(gpu[0]["metrics"]["prompt_tokens"], 65)
+        self.assertEqual(gpu[0]["metrics"]["stage1_capture_metal_calls"], 18)
+        self.assertEqual(gpu[1]["metrics"]["stage1_capture"], "none")
+        self.assertEqual(gpu[2]["metrics"]["stage1_capture"], "metal")
 
     @unittest.skipUnless(os.environ.get("ROCKET_TEST_METAL") == "1", "Set ROCKET_TEST_METAL=1 on a Metal GPU build")
     def test_metal_full_selection_matches_cpu(self):

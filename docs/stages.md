@@ -1,10 +1,10 @@
 # Stage 1 与 Stage 2：从删掉部分 KV 到每步只读部分 KV
 
-当前实现的主线是：**Stage 1 在 prefill 后淘汰部分历史 KV，Stage 2 在每次 decode attention 中临时选择部分候选 KV。** 最新修改进一步优化了 Stage 1 的 CPU 数据布局，两个阶段的选择策略保持不变。
+当前实现的主线是：**Stage 1 在 prefill 后淘汰部分历史 KV，Stage 2 在每次 decode attention 中临时选择部分候选 KV。** Stage 1 可以选择 CPU 或 Metal 评分；Metal 路径现在直接在 GPU 上捕获所需 Q/K，Top-K 和 KV 删除仍在 CPU。默认保留已有的 CPU 四路 K 打包路径。
 
-更新日期：2026-11-17（北京时间）。本文以 `main`（`330d43e`）为历史起点，讲解当前 `xiang/dev`（`402ee70`）的完整两阶段实现。代码路径相对仓库根目录，行号对应 `402ee70`。
+更新日期：2026-11-18（北京时间）。本文以 `main`（`330d43e`）为历史起点，讲解 `xiang/dev` 的完整两阶段实现，包括 `402ee70` 的 CPU 优化和本次 Metal Stage 1 工作区修改。代码路径相对仓库根目录，行号对应本次修改后的文件。
 
-阅读路线：第 3 节讲 Stage 1 的打分、淘汰和 CPU 优化；第 4–6 节讲 Stage 2 的粗筛、精算、模型接入和 Metal 优化；最后保留检查要点与五道自测题。最新实验保留了 Stage 1 的四路 K 打包，撤回了没有稳定收益的 Stage 2 softmax 改动。
+阅读路线：第 3 节讲 Stage 1 的打分、淘汰、CPU 优化及新增 Metal 路径；第 4–6 节讲 Stage 2 的粗筛、精算、模型接入和 Metal 优化；最后保留检查要点与五道自测题。此前撤回的 Stage 2 softmax SIMD 尝试没有重新启用；本次只抽取相同的 softmax 归约供两个阶段复用。
 
 ## 1. 背景：两个阶段分别解决什么问题
 
@@ -24,7 +24,7 @@ output = softmax(scores) @ V
 - **Stage 1 决定哪些历史 KV 留在候选池里。** Prefill 后做一次淘汰。
 - **Stage 2 决定这次 attention 使用候选池里的哪些 KV。** 每个 decode forward、每层重新选择。
 
-对应实现：`src/runner.cpp:346`、`src/rocket.cpp:240`。
+对应实现：`src/runner.cpp:368`、`src/rocket.cpp:264`。
 
 ### 本次修改的直接背景
 
@@ -32,11 +32,11 @@ output = softmax(scores) @ V
 
 | 部分 | 原来的 `main` | 当前实现 |
 |---|---|---|
-| Stage 1 | 已计算保留位置并删除 KV | 保留策略，补强数据读取、校验、四路点积和 K 打包 |
+| Stage 1 | 已计算保留位置并删除 KV | 补强数据读取、校验和 CPU K 打包；新增可选 Metal 评分 |
 | Stage 2 | 有独立算法函数，未接入 runner 的模型 attention | 接入每层计算图，影响后续生成 |
 | GPU HSA | 没有当前 Metal 实现 | 有 Metal kernels、缓存及图内执行 |
 
-历史调用点是 `main` 的 `runner.cpp:244` 和 `runner.cpp:315`；当前接入点见 `src/runner.cpp:386`、`src/rocket_adapter.cpp:87`。
+历史调用点是 `main` 的 `runner.cpp:244` 和 `runner.cpp:315`；当前接入点见 `src/runner.cpp:414`、`src/rocket_adapter.cpp:87`。
 
 ## 2. 核心直觉：用一个小例子串起来
 
@@ -54,7 +54,7 @@ Stage 1 保留 5 个，其中最后 2 个属于必须保留的观察窗口：
 retained_positions = [0, 3, 6, 8, 9]
 ```
 
-位置 `1、2、4、5、7` 从当前序列的有效 KV 中移除，后续 Stage 2 不能再选到它们。删除逻辑见 `src/runner.cpp:371`。
+位置 `1、2、4、5、7` 从当前序列的有效 KV 中移除，后续 Stage 2 不能再选到它们。删除逻辑见 `src/runner.cpp:399`。
 
 下一次 decode forward 处理位置 `10` 的 token，将它的 KV 加入候选池：
 
@@ -68,7 +68,7 @@ candidate_positions = [0, 3, 6, 8, 9, 10]
 selected_positions = [6, 8, 9]
 ```
 
-这次只对这 3 个位置计算精确 attention，但 `[0, 3, 10]` **仍留在候选池里**，下一步可能被选中。候选追加和选择逻辑分别在 `src/rocket_adapter.cpp:115`、`src/rocket.cpp:409`。
+这次只对这 3 个位置计算精确 attention，但 `[0, 3, 10]` **仍留在候选池里**，下一步可能被选中。候选追加和选择逻辑分别在 `src/rocket_adapter.cpp:115`、`src/rocket.cpp:433`。
 
 **因此，Stage 1 是淘汰；Stage 2 是临时选择。Stage 2 的 `topk_decode` 不是 KV cache 的存储容量。**
 
@@ -84,16 +84,16 @@ Stage 1 的核心思路是：**用提示词末尾几个 token 的 Query，判断
 g_acts.target_layer = llama_model_n_layer(model) - 1;
 ```
 
-这行代码只是指定捕获哪一层，**本身不读取张量，也不选择 token**。假设模型有 32 层，层编号从 0 开始，这里指定的就是第 31 层。见 `src/runner.cpp:319`。
+这行代码只是指定捕获哪一层，**本身不读取张量，也不选择 token**。假设模型有 32 层，层编号从 0 开始，这里指定的就是第 31 层。见 `src/runner.cpp:335`。
 
-随后执行 prefill 时，回调只接收这一层经过 RoPE（位置编码）后的 Q/K，并存入：
+随后执行 prefill 时，回调只接收这一层经过 RoPE（位置编码）后的 Q/K。CPU 后端将它们存入下面的数组；Metal 后端直接调用 GPU 捕获接口，不建立这些数组：
 
 ```cpp
 g_acts.q  // 最后一层各 Query head、各 token 的 Q
 g_acts.k  // 最后一层各 KV head、各 token 的 K
 ```
 
-捕获逻辑见 `src/runner.cpp:63`。这里只用 Q/K 判断重要性，不需要 V。Prefill 完成后，runner 把这些数据传给 `compute_prefill_eviction()`，才开始选择保留位置。见 `src/runner.cpp:354`。
+捕获逻辑在 `src/runner.cpp` 的 `eval_callback()`。这里只用 Q/K 判断重要性，不需要 V。CPU 路径把数据存入数组，prefill 完成后调用 `compute_prefill_eviction()`；Metal 路径通过 `capture_prefill()` 保存 GPU 数据，最后调用 `finish_prefill()` 选择保留位置。
 
 #### 第二步：用观察窗口的 Query 给历史候选打分
 
@@ -104,7 +104,7 @@ g_acts.k  // 最后一层各 KV head、各 token 的 K
 观察窗口位置 = [8, 9]  # 直接保留，不参与淘汰
 ```
 
-虽然收集了全部 Q，但打分只用最后两个位置的 Q。GQA 中，多个 Query heads 共享同一个 KV head，构成一个 KV group。对每个 Query head，计算：
+打分只用最后两个位置的 Q。CPU 路径仍收集全部 Q，Metal 驻留路径只保存观察窗口内的 Q。GQA 中，多个 Query heads 共享同一个 KV head，构成一个 KV group。对每个 Query head，计算：
 
 ```python
 # 示意代码：Q、K 均来自最后一层。
@@ -117,7 +117,7 @@ head_scores[group] += p8 + p9
 
 再累加这个 KV group 中其他 Query heads 的贡献。越受末尾这些 Query 关注的历史位置，累计分数越高。
 
-当前实现的 softmax **只在观察窗口之前的历史候选中归一化**，不包含位置 `8、9`。因此，这里是在重新计算用于淘汰的分数，不是直接读取模型完整 attention 矩阵的一部分。见 `src/rocket.cpp:135`、`src/rocket.cpp:176`。
+当前实现的 softmax **只在观察窗口之前的历史候选中归一化**，不包含位置 `8、9`。因此，这里是在重新计算用于淘汰的分数，不是直接读取模型完整 attention 矩阵的一部分。见 `src/rocket.cpp:151`、`src/rocket.cpp:192`。
 
 #### 第三步：局部最大值池化，再汇总各组分数
 
@@ -132,7 +132,7 @@ pooled[group, i] = max(head_scores[group, j] for j in neighbors)
 score[i] = sum(pooled[group, i] for group in kv_groups)
 ```
 
-所以高分可能来自这个位置本身，也可能来自它的邻居。注意执行顺序是：先在每组内部池化，再跨组求和。见 `src/rocket.cpp:189`、`src/rocket.cpp:212`。
+所以高分可能来自这个位置本身，也可能来自它的邻居。注意执行顺序是：先在每组内部池化，再跨组求和。见 `src/rocket.cpp:205`、`src/rocket.cpp:219`。
 
 #### 第四步：取高分历史 token，加上观察窗口
 
@@ -154,15 +154,15 @@ history_keep = prompt_budget - obs_w  # 本例为 5 - 2 = 3
 最终保留   = [0, 3, 6, 8, 9]
 ```
 
-代码用 `std::nth_element` 取高分候选，再加入观察窗口，最后按原始位置排序。见 `src/rocket.cpp:219`。如果提示词本身没有超过保留预算，就直接保留全部位置，无须淘汰。
+CPU 和 Metal 共用 `select_prefill_tokens()`：用 `std::nth_element` 取高分候选，再加入观察窗口，最后按原始位置排序。见 `src/rocket.cpp:243`。如果提示词本身没有超过保留预算，就直接保留全部位置，无须淘汰。
 
-runner 随后移除其他位置的 KV。**各层删的是相同位置，但各层保留的仍是自己原来的 K/V 数值**，不会把最后一层的 KV 复制给其他层。见 `src/runner.cpp:371`。
+runner 随后移除其他位置的 KV。**各层删的是相同位置，但各层保留的仍是自己原来的 K/V 数值**，不会把最后一层的 KV 复制给其他层。见 `src/runner.cpp:399`。
 
 这就得到一份所有层共享的保留名单，而不是每层或每个 head 各选一份。概括起来：**最后一层负责给历史 token 的重要性打分，产生全局位置名单，再用这份名单统一裁剪各层 KV cache。**
 
 ### 3.2 把“读到 Q/K”变成可靠的数据交接
 
-原来读取 prefill 张量时，长度为 1 的小批次会被跳过。现在按张量的实际字节步长读取，并检查形状、类型和最终捕获数量。见 `src/runner.cpp:76`、`src/runner.cpp:342`。
+原来读取 prefill 张量时，长度为 1 的小批次会被跳过。现在按张量的实际字节步长读取，并检查形状、类型和最终捕获数量。见 `src/runner.cpp:78`、`src/runner.cpp:365`。
 
 为什么重要？假设提示词分成 `8 + 1` 两批处理，最后一个 token 仍然属于 prefill。漏掉它，就可能让 Stage 1 用不完整的 Q/K 做淘汰。
 
@@ -172,13 +172,13 @@ runner 随后移除其他位置的 KV。**各层删的是相同位置，但各�
 adapter->initialize(config, kept_positions, full_attention);
 ```
 
-位置：`src/runner.cpp:386`。
+位置：`src/runner.cpp:414`。
 
 回到例子，这一步交出去的是 `[0, 3, 6, 8, 9]`，而不只是“剩下 5 个 token”这个数字。
 
 ### 3.3 CPU 优化：四个独立点积，加上连续的数据布局
 
-这部分经过两步优化。提交 `c8bf4ee` 先把一次算一个 Key，改为同时推进四个独立点积；最新提交 `402ee70` 则让这四个点积需要的数据在内存中排得更合适。
+这部分经过两步优化。提交 `c8bf4ee` 先把一次算一个 Key，改为同时推进四个独立点积；提交 `402ee70` 则让这四个点积需要的数据在内存中排得更合适。
 
 #### 原来：四个点积已经交错执行，但 K 仍按 token 存储
 
@@ -209,7 +209,7 @@ K3 = [d0, d1, d2]
 dst[4 * d + lane] = src[lane * cfg.dim_head + d];
 ```
 
-位置：`src/rocket.cpp:123`。打包发生在 Query head 和观察窗口循环之外，因此同一组历史 K 可以被多个 Query 重复使用。
+位置：`src/rocket.cpp:139`。打包发生在 Query head 和观察窗口循环之外，因此同一组历史 K 可以被多个 Query 重复使用。
 
 点积循环随后连续读取同一维度上的四个 Key：
 
@@ -221,15 +221,15 @@ dot2 += q * k_ptr[4 * d + 2];
 dot3 += q * k_ptr[4 * d + 3];
 ```
 
-位置：`src/rocket.cpp:147`。
+位置：`src/rocket.cpp:163`。
 
 直觉是：读取一个 `q[d]`，就拿它和相邻的四个 Key 值相乘，使编译器更容易使用 SIMD，也就是用一条向量指令处理多个独立数据。
 
-**每个 token 仍有自己独立的完整点积，按原来的维度顺序累加。** 不足四个 Key 的尾部继续读取原始 K；softmax、池化和 Top-K 不变。临时打包也不会修改模型实际存储的 KV cache。见 `src/rocket.cpp:166`。
+**每个 token 仍有自己独立的完整点积，按原来的维度顺序累加。** 不足四个 Key 的尾部继续读取原始 K；softmax、池化和 Top-K 不变。临时打包也不会修改模型实际存储的 KV cache。见 `src/rocket.cpp:182`。
 
 代价是多一次打包和一块临时缓冲区。8k、`head_dim=128` 时，每个正在处理的 KV group 约增加 4 MiB；当前默认构建按组串行处理，启用 OpenMP 后应计入并发组的内存。边界覆盖见 `tests/test_rocket.cpp:152`。
 
-### 3.4 最新优化的实际收益
+### 3.4 CPU K 打包优化的历史收益
 
 本轮在 Apple M2、16 GiB 内存上，使用 Llama-3.2-3B-Instruct-Q8_0、F16 KV、Metal 全层 offload，固定 `token_budget=1024`、观察窗口 32、池化宽度 63、4 CPU threads。
 
@@ -245,6 +245,117 @@ LongBench 取 `multi_news`、`trec`、`passage_retrieval_en`、`repobench-p` 各
 
 实验细节和原始数据入口见 `docs/optimize_exp_1116/e1.md`、`docs/optimize_exp_1116/results.md`。这些结论适用于本轮模型、硬件和任务子集。
 
+### 3.5 新增 Metal Stage 1：GPU 评分，CPU 选择和删除
+
+通过 `--stage1-backend metal` 启用；省略时仍使用 `cpu`。该选项支持 `--rocket-mode stage1` 和 `hsa`，与 `--stage2-backend` 独立。
+
+```text
+GPU：模型产生最后一层经过 RoPE 的 Q/K
+  → 捕获 kernel 校验、转换类型并保存观察窗口 Q
+  → 同时将历史 K 写为 [kv_head, dim, history_token]
+  → 并行计算观察窗口各 Query 与历史 K 的点积
+  → 每行 softmax
+  → 同一 KV group 内累加
+  → 每组局部 max pooling，再跨组汇总
+CPU：读取每个历史 token 的最终分数
+  → 共用 Top-K，追加观察窗口，按位置排序
+  → 通过 llama_memory_seq_rm() 删除未保留位置
+```
+
+`src/metal/rocket_metal.mm` 的 `begin_prefill()` 准备缓冲区，`capture_prefill()` 在各个 microbatch 的 Q/K 回调中保存数据，`finish_prefill()` 在一个 command buffer 中提交点积、softmax、归约和池化，完成后才读回最终分数。捕获与评分 kernel 均在 `src/metal/rocket_metal.metal`。原有 `prefill()` 接口继续用于主机数组对照测试；它们共用评分和 Top-K 实现。
+
+CPU 和 Metal 使用相同的评分公式、组内池化顺序、保留预算及 Top-K 比较器。**GPU softmax 的浮点归约顺序与 CPU 不同，边界分数很接近时，保留名单仍可能不同。** 因此默认不自动切换后端，测试同时比较分数误差、保留位置及模型输出。
+
+对能够直接绑定的 Metal 张量，Q/K 不再读入 CPU 数组；捕获 kernel 按实际步长读取 F32/F16/BF16，并直接写入评分所需布局。在 8k、24 Query heads、8 KV heads、维度 128、窗口 32 下，驻留路径缓冲区数据量约 57 MiB，较第一版省去约 32 MiB 原始 K 缓冲区，也不再分配原先合计 128 MiB 的完整 CPU Q/K 数组。复用时容量增长可能占用更多内存，这些是缓冲区数据量估算，不是进程 RSS 实测。
+
+CPU 模型或不能直接绑定的张量仍支持主机读取，再由 GPU 转换布局；输出 `stage1_capture` 明确区分 `metal`、`host`、`mixed`、`none`。`stage1_capture_host_bytes` 记录捕获阶段实际读入主机的 Q/K 字节数，直接 Metal 路径应为 0；`stage1_capture_metal_calls` 记录直接绑定的捕获次数。这些指标不包含诊断模式下读取的 logits/attention。
+
+当输入不需要淘汰时，跳过 Q/K 捕获和 Stage 1 GPU 工作，输出 `stage1_backend: "none"`；`requested_stage1_backend` 仍记录用户选择。Metal 评分不可用、输入非法或 GPU 计算失败时明确报错，不静默切换评分后端。
+
+同时启用两个 Metal 阶段：
+
+```bash
+make runner
+build/runner \
+  --model models/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --batch input.json --output output.json \
+  --rocket-mode hsa --stage1-backend metal --stage2-backend metal \
+  --gpu-layers 99 --kv-type f16 --threads 4 \
+  --budget 1024 --n-ctx 9216 --context-len 8192
+```
+
+也可以给 `scripts/stage2.sh run` 设置 `STAGE1_BACKEND=metal`。只迁移 Stage 1 时，使用 `--rocket-mode stage1 --stage1-backend metal`，不设置 `--stage2-backend metal`。
+
+本次验证包括非向量宽度的维度、255/256/257 等长度边界、观察窗口保留、同分、只保留窗口、无需淘汰、跨请求缓冲区复用、非法输入和浮点溢出；真实模型检查包含分批 prefill 及两个 Metal 阶段同时启用。
+
+### 3.6 第一版 Metal 评分的历史实测结果
+
+本节对应尚未移除 CPU Q/K 中转的版本，原二进制另存为 `build/runner-s1-host`；数据不能直接作为当前驻留路径的测速结果。
+
+在同一台 Apple M2、16 GiB 机器上，以 Llama-3.2-3B-Instruct-Q8_0、F16 KV、全层 Metal offload 测量。两边都启用 Metal Stage 2，只切换 Stage 1 后端；预算 1024、窗口 32、池化宽度 63、4 CPU threads、ubatch 1024。
+
+取前述四项 LongBench 任务的第一条输入，每条最多生成 8 个 token，每个长度上限各做 4 对 CPU/Metal 运行，总计 24 次；相邻样本交替后端运行顺序。每条样本启动新进程，`evict_ms` 包含第一次 Stage 1 缓冲区分配、数据复制、GPU 提交/等待、CPU Top-K 及 KV 删除；模型加载和 Metal pipeline 初始化在计时之外。
+
+| 输入上限 | CPU 淘汰耗时中位数 | Metal 淘汰耗时中位数 | 配对淘汰耗时降低 | 配对 TTFT 降低 |
+|---|---:|---:|---:|---:|
+| 2048 | 56.672 ms | 15.500 ms | 74.07% | 2.58% |
+| 4096 | 118.642 ms | 35.822 ms | 72.25% | 0.97% |
+| 8192 | 170.411 ms | 48.745 ms | 69.53% | -3.01% |
+
+配对百分比为 `100 * (1 - median(metal_ms / cpu_ms))`，不是两列中位数直接相除。四条输入的实际长度分别为：2k 上限下全为 2048；4k 下为 `[2664, 4096, 4096, 4096]`；8k 下为 `[2664, 4957, 8192, 8192]`，短输入不填充。
+
+**这轮确认了 Stage 1 淘汰阶段的耗时下降，整体首 token 延迟没有呈现稳定改善。** 8k 上限下 TTFT 的配对中位比反而增加 3.01%；这一轮 prefill 耗时也有波动，尚未隔离波动来源。默认继续使用 CPU，由用户显式启用 Metal。
+
+12 对短生成的文本和生成 token 数均一致。这是短生成一致性检查，不是任务标准输出长度下的 LongBench 质量评测。原始输出、命令及二进制哈希在 `results/stage1-metal/`，汇总为 `summary.json`。
+
+另用 `passage_retrieval_en` 第一条输入，在实际 2048/4096/8192 token 下各强制生成 `[10, 11]`，单独比较 CPU/Metal 的保留位置、logits 和逐层 attention。三组保留位置完全一致，logits 与 attention 的最大绝对误差均为 0；这些带 trace 的运行不计入测速，结果在 `results/stage1-metal/traces/checks.json`。
+
+本节原始命令、输入和二进制/脚本哈希保存在 `results/stage1-metal/`。当前 `scripts/bench_stage1.py` 默认比较 CPU Stage 1 与驻留 Metal Stage 1；传入 `--host-runner` 时，改为比较第一版主机捕获、当前驻留路径和原生 full-KV baseline。
+
+### 3.7 GPU 驻留捕获的同步边界
+
+捕获接口按 Q、K 分别累计 microbatch 的位置偏移。每个源张量只在回调期间借用；捕获 kernel 完成后才返回，GGML 随后可以复用源缓冲区。自己的 Q/K 缓冲区一直保留到评分完成，不保留跨请求的旧评分数据。
+
+当前 GGML eval callback 会先同步模型计算，再进入项目侧捕获；项目侧使用独立 Metal command queue，等待捕获完成后返回。因此，**这次消除了 Q/K 的 CPU 读取、逐元素转换和数组重排，但没有消除回调同步，也没有把捕获合并到模型的 command encoder 中**。Top-K、KV 元数据更新及最终分数读取仍在 CPU。
+
+缓冲区准备现在发生在 prefill 开始时，计入 `prefill_ms`。第一版的这部分分配在 `evict_ms` 内，因此比较新旧版本必须同时看 `prefill_ms + evict_ms` 或 TTFT，不能只比较淘汰耗时。
+
+独立正确性检查使用同一个 3B 模型，在实际 2048/4096/8192 token 下比较第一版与驻留路径。三组保留位置和强制 token IDs 完全一致，logits 与逐层 attention 的最大绝对误差均为 0；Q/K 主机读取字节数全部为 0，直接 GPU 捕获分别为 4/8/16 次。原始结果在 `results/capture-traces/`。这些运行启用了 trace，不用于性能结论。
+
+单元测试另外覆盖 F32/F16/BF16、非连续维度步长、非零视图偏移、源缓冲区在每次捕获后立即覆写、窗口跨 microbatch、单 token 尾部、请求复用、非法偏移和非有限值；CPU 模型的主机读取路径也有对照。
+
+### 3.8 驻留路径与原生 baseline 的短测
+
+使用同一台 M2 和同一个 3B Q8_0 模型，取 LongBench `repobench-p` 第一条输入，分别截断至实际 2048/4096/8192 token；每种长度运行两轮，轮换三种路径的执行顺序，共 18 次推理。所有运行均为 F16 KV、`--gpu-layers 99`、4 CPU threads、ubatch 1024、预算 1024、窗口 32、池化宽度 63；上下文容量为输入长度加 32。
+
+- `host`：保留的第一版二进制，CPU 捕获 Q/K，Metal Stage 1 + Metal Stage 2。
+- `metal`：当前二进制，GPU 驻留捕获，Metal Stage 1 + Metal Stage 2。
+- `off`：当前二进制，`--rocket-mode off`，原生完整 KV attention。
+
+各次运行均生成 32 个 token、执行 31 次 decode forward；新旧 RocketKV 路径的生成文本在六对运行中全部一致。原生 baseline 的生成内容不作为这次优化的一致性标准，本次也没有计算任务质量分数。
+
+| 实际输入长度 | 相对旧主机捕获的总耗时降低 | 相对原生 baseline 的总耗时降低 | 驻留路径 decode ms/步 | 原生 baseline decode ms/步 |
+|---|---:|---:|---:|---:|
+| 2048 | -7.42% | -14.16% | 81.528 | 55.277 |
+| 4096 | -0.38% | 1.80% | 77.065 | 71.110 |
+| 8192 | 1.74% | 15.92% | 82.997 | 95.784 |
+
+正值表示减少耗时，负值表示变慢。总耗时按 runner 的 `ttft_ms + ms_per_token * decode_tokens` 计算；百分比使用逐轮配对耗时比的中位数，decode 耗时列是两轮中位数。首次捕获分配和执行计入 TTFT，模型加载及 pipeline 初始化不计入。
+
+**本轮已确认去掉了 Q/K 主机读取，但尚未确认相对旧捕获路径的稳定端到端加速。** 两轮之间波动很大，例如旧路径的 2k TTFT 从 4.93 秒变为 9.72 秒。表中 8k 相对原生 baseline 的优势只能作为这条输入、这次短测的观察，不能推广到整个 LongBench 或归因于本次捕获改动。
+
+原始结果和哈希在 `results/capture-metal/`，汇总为 `summary.json`。复现相同样本和参数：
+
+```bash
+caffeinate -i python3 scripts/bench_stage1.py \
+  --model models/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --batch results/capture-metal/samples.json \
+  --host-runner build/runner-s1-host \
+  --output results/capture-repeat --repeats 2 --max-tokens 32
+```
+
+`build/runner-s1-host` 是本地保留的旧二进制；没有该文件时，可以省略 `--host-runner`，脚本改为比较当前 CPU Stage 1 与驻留 Metal Stage 1。结果目录必须是新目录，避免覆盖已有实验。
+
 ## 4. 代码导览：Stage 2 怎样选择 KV
 
 ### 4.1 先粗筛，再精算
@@ -254,13 +365,13 @@ Stage 2 的 HSA，即混合稀疏注意力，分成两个层次：
 1. 用较便宜的近似分数选 token。
 2. 对选中的 token，用完整维度重新计算 attention。
 
-**“精确”指选中子集上的 attention，并不意味着结果等于完整候选池的 dense attention。** 见 `src/rocket.cpp:335`、`src/rocket.cpp:426`。
+**“精确”指选中子集上的 attention，并不意味着结果等于完整候选池的 dense attention。** 见 `src/rocket.cpp:359`、`src/rocket.cpp:450`。
 
 ### 4.2 粗筛如何变便宜
 
 这里有两个缩减：少看一些 Query 维度，把多个候选 token 合成一个 chunk。
 
-**GQA group** 是共享同一组 K/V 的多个 Query heads。代码先汇总组内各 Query 在每个维度上的绝对值，选出重要的 `r` 个维度。这里是**维度选择**，不是新增一个学习出来的投影矩阵。见 `src/rocket.cpp:277`。
+**GQA group** 是共享同一组 K/V 的多个 Query heads。代码先汇总组内各 Query 在每个维度上的绝对值，选出重要的 `r` 个维度。这里是**维度选择**，不是新增一个学习出来的投影矩阵。见 `src/rocket.cpp:301`。
 
 然后，按候选池顺序分 chunk。沿用我们的例子，设 `chunk_size = 2`：
 
@@ -272,7 +383,7 @@ chunk 2: [9, 10]
 
 注意：分块依据是候选数组中的相邻关系；原始 token 位置不必连续。
 
-CPU reference 按需要计算 chunk 在选中维度上的 Key 极值；Metal 路径缓存各维度的最小值和最大值，再根据 Query 的组内符号选择代表值。用这些代表值计算近似分数，经过每个 Query head 的 softmax，再在组内汇总。见 `src/rocket.cpp:296`、`src/rocket.cpp:335`、`src/rocket.cpp:374`、`src/metal/rocket_metal.metal:49`。
+CPU reference 按需要计算 chunk 在选中维度上的 Key 极值；Metal 路径缓存各维度的最小值和最大值，再根据 Query 的组内符号选择代表值。用这些代表值计算近似分数，经过每个 Query head 的 softmax，再在组内汇总。见 `src/rocket.cpp:320`、`src/rocket.cpp:359`、`src/rocket.cpp:398`、`src/metal/rocket_metal.metal:49`。
 
 假设最后得到：
 
@@ -283,7 +394,7 @@ chunk 2 score = 0.3
 topk_decode = 3
 ```
 
-同一 chunk 的 token 共享近似分数，因此选中 chunk 1 的两个 token，再从 chunk 2 选一个。同分时位置靠前的候选优先，得到 `[6, 8, 9]`。见 `src/rocket.cpp:394`、`src/rocket.cpp:409`。
+同一 chunk 的 token 共享近似分数，因此选中 chunk 1 的两个 token，再从 chunk 2 选一个。同分时位置靠前的候选优先，得到 `[6, 8, 9]`。见 `src/rocket.cpp:418`、`src/rocket.cpp:433`。
 
 ### 4.3 精算不会继续使用粗筛分数
 
@@ -295,7 +406,7 @@ for (int d = 0; d < cfg.dim_head; ++d) {
 }
 ```
 
-位置：`src/rocket.cpp:440`。
+位置：`src/rocket.cpp:464`。
 
 可以把粗筛理解成“挑出要认真阅读的资料”，精算则是“读原始资料后重新给出判断”。粗筛分数只负责入选，不直接充当最终 attention 权重。
 
@@ -316,11 +427,11 @@ llama_synchronize(ctx);
 if (enable_hsa) adapter->finish_step();
 ```
 
-位置：`src/runner.cpp:451`。
+位置：`src/runner.cpp:479`。
 
 HSA 就发生在中间的 `llama_decode()` 内。`finish_step()` 检查本步是否执行完所有模型层，以及 GPU 是否报告错误。见 `src/rocket_adapter.cpp:125`。
 
-还有一个容易混淆的细节：**第一个生成 token 来自 prefill logits。** 它作为下一次 decode 的输入时，HSA 才开始工作。见 `src/runner.cpp:421`。
+还有一个容易混淆的细节：**第一个生成 token 来自 prefill logits。** 它作为下一次 decode 的输入时，HSA 才开始工作。见 `src/runner.cpp:449`。
 
 ### 5.2 区分原始位置、候选下标和物理槽位
 
@@ -340,7 +451,7 @@ GPU 最终也是通过映射读 KV：
 read_kv(kr, group, uint(slots[t]), d, p.kh, p.kt, p.kd)
 ```
 
-位置：`src/metal/rocket_metal.metal:300`。
+位置：`src/metal/rocket_metal.metal:385`。
 
 这一步保证“选中了正确的历史 token”和“读到了那个 token 的 KV”是同一件事。
 
@@ -348,19 +459,19 @@ read_kv(kr, group, uint(slots[t]), d, p.kh, p.kt, p.kd)
 
 ### 6.1 不只是把一个函数放到 GPU 上
 
-当前 Metal 实现包含摘要、Query 维度选择、近似打分、Top-K、精确打分、softmax 和加权求和。调度顺序在 `src/metal/rocket_metal.mm:313`。
+当前 Stage 2 Metal 实现包含摘要、Query 维度选择、近似打分、Top-K、精确打分、softmax 和加权求和。调度顺序在 `src/metal/rocket_metal.mm:508`。
 
 在支持的 buffer 路径上，这些操作直接编码进 GGML 已有的 Metal command encoder，也就是记录 GPU 工作的命令编码器，读取模型的 Q/K/V，并写回模型需要的输出。
 
-这样就不必每层都单独提交一份 HSA 工作，再等待和搬运结果。同步路径仍为不能直接绑定的输入保留。见 `src/metal/rocket_metal.mm:278`、`src/metal/rocket_metal.mm:334`。
+这样就不必每层都单独提交一份 HSA 工作，再等待和搬运结果。同步路径仍为不能直接绑定的输入保留。见 `src/metal/rocket_metal.mm:473`、`src/metal/rocket_metal.mm:529`。
 
 ### 6.2 缓存旧 chunk 的摘要
 
 生成时通常是在候选池尾部追加 token，前面的完整 chunk 不变。当前实现因此复用旧摘要，更新未满的尾 chunk 和新增 chunk。
 
-但复用有前提：层、维度、chunk 大小、存储步长和已有槽位前缀必须匹配；不匹配就重建。见 `src/metal/rocket_metal.mm:226`、`src/metal/rocket_metal.mm:231`。
+但复用有前提：层、维度、chunk 大小、存储步长和已有槽位前缀必须匹配；不匹配就重建。见 `src/metal/rocket_metal.mm:421`、`src/metal/rocket_metal.mm:426`。
 
-提交 `6a6a8c7` 还调整了摘要布局：让相邻 GPU 线程读取相邻 chunk 时，访问的地址也相邻。使用容量步长而不是每步变化的 chunk 数作为步长，避免追加一个 chunk 就让全部旧摘要地址改变。容量跨越扩容边界、步长改变时，摘要会重建。见 `src/metal/rocket_metal.metal:60`、`src/metal/rocket_metal.mm:212`。
+提交 `6a6a8c7` 还调整了摘要布局：让相邻 GPU 线程读取相邻 chunk 时，访问的地址也相邻。使用容量步长而不是每步变化的 chunk 数作为步长，避免追加一个 chunk 就让全部旧摘要地址改变。容量跨越扩容边界、步长改变时，摘要会重建。见 `src/metal/rocket_metal.metal:60`、`src/metal/rocket_metal.mm:407`。
 
 ### 6.3 从完整排序改成找到入选门槛
 
@@ -370,15 +481,15 @@ read_kv(kr, group, uint(slots[t]), d, p.kh, p.kt, p.kd)
 
 其中的 **weighted** 很关键：一个 chunk 代表多个 token，所以计数时用该 chunk 的实际 token 数作权重。尾 chunk 如果只有一个 token，就只能贡献一个名额。
 
-找到门槛后，高于门槛的全部入选，等于门槛的按候选顺序补足，直接输出时间顺序的下标。见 `src/metal/rocket_metal.metal:190`。
+找到门槛后，高于门槛的全部入选，等于门槛的按候选顺序补足，直接输出时间顺序的下标。见 `src/metal/rocket_metal.metal:275`。
 
 **这项优化保持的是“对相同近似分数执行相同的 Top-K 选择”，不是把近似分数变成精确分数。**
 
 ### 6.4 加权求和：提前加载 V，仍按原顺序累加
 
-Stage 2 的最后一步是将选中 token 的 V 按精确 attention 权重求和。当前 Metal kernel 每次先加载四个 V，再依次累加四项；不足四项的尾部单独处理。见 `src/metal/rocket_metal.metal:305`。
+Stage 2 的最后一步是将选中 token 的 V 按精确 attention 权重求和。当前 Metal kernel 每次先加载四个 V，再依次累加四项；不足四项的尾部单独处理。见 `src/metal/rocket_metal.metal:390`。
 
-调度时，该 kernel 使用 64 个线程组成一个 threadgroup。见 `src/metal/rocket_metal.mm:333`。这里保留每个输出元素的原始求和顺序，没有把一个长和拆成多份后再合并；历史实验中，改变求和顺序的方案曾出现长输入数值漂移。已有优化的取舍记录在 `HSA_OPTIMIZATION_LOG.md`。
+调度时，该 kernel 使用 64 个线程组成一个 threadgroup。见 `src/metal/rocket_metal.mm:528`。这里保留每个输出元素的原始求和顺序，没有把一个长和拆成多份后再合并；历史实验中，改变求和顺序的方案曾出现长输入数值漂移。已有优化的取舍记录在 `HSA_OPTIMIZATION_LOG.md`。
 
 ### 6.5 最新尝试：softmax 的 SIMD 归约已撤回
 
@@ -392,9 +503,9 @@ Stage 2 的最后一步是将选中 token 的 V 按精确 attention 权重求和
 8k: -0.24%
 ```
 
-三个长度的 95% 区间都跨过零，没有确认稳定收益，因此撤回候选代码及专用测试。**撤回的只是这次 softmax 优化；Stage 2 的图内 HSA、摘要缓存、weighted radix selection 和已有加权求和优化全部保留。** 当前 softmax 仍使用原来的线程组归约，见 `src/metal/rocket_metal.metal:141`。
+三个长度的 95% 区间都跨过零，没有确认稳定收益，因此撤回候选代码及专用测试。**撤回的只是这次 softmax 优化；Stage 2 的图内 HSA、摘要缓存、weighted radix selection 和已有加权求和优化全部保留。** 当前 softmax 仍使用原来的线程组归约，已提取为 `normalize_row()` 供两个阶段共用，见 `src/metal/rocket_metal.metal:141`。
 
-尝试过程、数值一致性检查和弃用 patch 保存在 `docs/optimize_exp_1116/e2.md` 与同目录 `e2.patch`。本轮保留的修改只涉及 Stage 1 的项目侧代码和测试，没有进一步修改 `llama.cpp/`。
+尝试过程、数值一致性检查和弃用 patch 保存在 `docs/optimize_exp_1116/e2.md` 与同目录 `e2.patch`。该轮实验保留了 Stage 1 CPU 优化；本次新增 Stage 1 Metal 路径同样没有修改 `llama.cpp/`。
 
 ## 7. 阅读这类修改时，要重点检查什么
 
@@ -404,15 +515,15 @@ Stage 2 的最后一步是将选中 token 的 V 按精确 attention 权重求和
 
 ### 7.2 优化必须保留边界规则
 
-Stage 1 要检查四路打包的尾部和非向量宽度的 head dimension；Stage 2 要检查 chunk 尾部不足、同分和接近全选。这里应同时核对选中下标和 attention 输出，而不是只看生成文本是否像样。见 `tests/test_rocket.cpp:152`、`tests/test_metal.cpp:318`。
+Stage 1 要检查四路打包的尾部、非向量宽度的 head dimension 及 CPU/Metal 分数误差；Stage 2 要检查 chunk 尾部不足、同分和接近全选。这里应同时核对选中下标和 attention 输出，而不是只看生成文本是否像样。见 `tests/test_rocket.cpp:152`、`tests/test_metal.cpp` 的 `compare_prefill()` 和 `compare()`。
 
 ### 7.3 缓存和异步执行增加了状态管理责任
 
-上一请求的摘要、上一层的临时空间、旧的槽位映射都不能被错误复用。当前实现有请求 reset、逐层缓存和同步后错误检查；修改这些路径时要一起追踪它们的生命周期。见 `src/rocket_adapter.cpp:53`、`src/metal/rocket_metal.mm:226`。
+上一请求的摘要、上一层的临时空间、旧的槽位映射都不能被错误复用。当前实现有请求 reset、逐层缓存和同步后错误检查；修改这些路径时要一起追踪它们的生命周期。见 `src/rocket_adapter.cpp:53`、`src/metal/rocket_metal.mm:421`。
 
 ### 7.4 减少有效 KV 数，不等于立即减少已分配内存
 
-Stage 1 删除的是有效序列位置；llama.cpp 可能仍保留预分配的 buffer。当前代码已经把 KV 大小指标注明为逻辑估算，不能直接当作进程或 GPU 实际内存节省。最新 K 打包还有单独的临时 CPU 内存开销。见 `src/runner.cpp:542`、`src/rocket.cpp:124`。
+Stage 1 删除的是有效序列位置；llama.cpp 可能仍保留预分配的 buffer。当前代码已经把 KV 大小指标注明为逻辑估算，不能直接当作进程或 GPU 实际内存节省。CPU K 打包和 Metal 评分还各有临时缓冲区开销。见 `src/runner.cpp:570`、`src/rocket.cpp:140` 及第 3.5 节。
 
 ## 8. 五道自测题
 
