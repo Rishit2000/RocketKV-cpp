@@ -1,0 +1,100 @@
+# RocketKV 32K 评测表
+
+| 实验组（表头与图例） | runner 模式 | Prefill 后的 KV | Decode attention |
+|---|---|---|---|
+| Full KV | `off` | 保留完整 KV | 原生 attention |
+| Stage 1 | `stage1` | 按 Stage 1 策略淘汰 | 原生 attention |
+| Stage 1 + Stage 2 | `hsa` | 与 Stage 1 组使用相同淘汰策略和预算 | 在保留的 KV 上执行 HSA 稀疏 attention |
+
+**比较方式：** Full KV 与 Stage 1 比较，衡量 prompt KV 淘汰的影响；Stage 1 与 Stage 1 + Stage 2 比较，衡量加入稀疏解码的增量影响。本轮没有独立的 Stage 2 组。
+
+**回填规则：** 按「表号 + 行名 + 实验组」定位，每格只填一个数字。例如，`hsa` 的 32K 峰值 RSS 填在「表 4b / 32,768 / Stage 1 + Stage 2」。未测或失败留空，不填 0；试跑分数不填入全量表。每组的 16 项任务分数齐全后再填宏平均。
+
+## 实验设置
+
+| 项目 | 计划 |
+|---|---|
+| 后端 | 两个压缩组均用 Metal 做 Stage 1 打分；Stage 1 + Stage 2 组另用 Metal 做稀疏解码 |
+| 固定条件 | 同一台 Mac；Llama-3.2-3B-Instruct Q8_0；F16 KV；单序列；压缩组预算 1024 |
+| 质量评测 | 输入上限 32,768 tokens；短样本保留原长，超长样本保留首尾 |
+| 运行配置 | 仓库现有 LongBench 配置仍为 8K。运行本表前设 `benchmark.context_len=32768`、`model.n_ctx=33792`，为生成预留空间 |
+| 样本范围 | 试跑标 ★ 的 4 个任务，各取前 30 条；正式表填 16 个任务的全量结果 |
+| 表 2–4b 的共同输入 | 固定使用 LongBench `multi_news` 测试集。按 JSONL 原序选前 4 条套用模板、经模型分词后达到 32,768 tokens 的输入，保存样本 ID。所有模式和四张表复用这批 ID；同一样本按相同规则截到各档长度，以 `prompt_tokens` 核对 |
+| 原始长样本不足 4 条时 | 用 `multi_news` 文档构造 4 个固定拼接输入，记录各输入的源 ID 和拼接顺序。整组表和图均标记为 `multi_news（拼接负载）`；不混入原始样本结果，不用于质量评分 |
+| 计时口径 | 每次 32 个 decode forward；同一输入、长度和模式重复 3 次，轮换模式顺序。先取重复中位数，再取跨输入中位数 |
+
+## 表 1 · LongBench 质量（任务分数，0–100，越高越好）
+
+| 任务 | 类型 | 生成上限（tokens） | Full KV | Stage 1 | Stage 1 + Stage 2 |
+|---|---|---:|---:|---:|---:|
+| `narrativeqa` | 单文档问答 | 128 | | | |
+| `qasper` | 单文档问答 | 128 | | | |
+| `multifieldqa_en` | 单文档问答 | 64 | | | |
+| `hotpotqa` | 多跳问答 | 32 | | | |
+| `2wikimqa` | 多跳问答 | 32 | | | |
+| `musique` | 多跳问答 | 32 | | | |
+| `gov_report` | 摘要 | 512 | | | |
+| `qmsum` | 摘要 | 512 | | | |
+| ★ `multi_news` | 摘要 | 512 | | | |
+| ★ `trec` | 少样本分类 | 64 | | | |
+| `triviaqa` | 少样本问答 | 32 | | | |
+| `samsum` | 少样本摘要 | 128 | | | |
+| `passage_count` | 段落计数 | 32 | | | |
+| ★ `passage_retrieval_en` | 段落检索 | 32 | | | |
+| `lcc` | 代码补全 | 64 | | | |
+| ★ `repobench-p` | 代码补全 | 64 | | | |
+| **宏平均** | **16 个任务等权** | — | | | |
+
+## 表 2 · `multi_news` · 首 token 延迟（秒，越低越好）
+
+| 实际输入长度（tokens） | Full KV | Stage 1 | Stage 1 + Stage 2 |
+|---:|---:|---:|---:|
+| 2,048 | | | |
+| 4,096 | | | |
+| 8,192 | | | |
+| 16,384 | | | |
+| 32,768 | | | |
+
+## 表 3 · `multi_news` · 解码延迟（毫秒/forward，越低越好）
+
+| 实际输入长度（tokens） | Full KV | Stage 1 | Stage 1 + Stage 2 |
+|---:|---:|---:|---:|
+| 2,048 | | | |
+| 4,096 | | | |
+| 8,192 | | | |
+| 16,384 | | | |
+| 32,768 | | | |
+
+## 表 4a · `multi_news` · Prefill 后保留的逻辑 KV（MiB）
+
+| 实际输入长度（tokens） | Full KV | Stage 1 | Stage 1 + Stage 2 |
+|---:|---:|---:|---:|
+| 2,048 | | | |
+| 4,096 | | | |
+| 8,192 | | | |
+| 16,384 | | | |
+| 32,768 | | | |
+
+- **KV**：取 runner 的 `kv_cache_mb`，按 prefill 后保留的 token 数估算。HSA 每步只读取部分候选，不会因此再删除 KV；`stage1` 和 `hsa` 两条线可以重合。
+
+## 表 4b · `multi_news` · Runner 进程峰值 RSS（MiB）
+
+| 实际输入长度（tokens） | Full KV | Stage 1 | Stage 1 + Stage 2 |
+|---:|---:|---:|---:|
+| 2,048 | | | |
+| 4,096 | | | |
+| 8,192 | | | |
+| 16,384 | | | |
+| 32,768 | | | |
+
+- **峰值 RSS**：每个样本独立启动 runner，用 macOS `/usr/bin/time -l` 直接包住 `build/runner`，取 `maximum resident set size` 的字节数除以 1,048,576。包含模型加载、prefill 和 decode；这是进程驻留内存峰值，不是 Metal 显存。三组固定相同 `n_ctx`，沿用表 2、3 的样本和汇总方式。
+
+## 作图清单
+
+| 图 | 数据 | 横轴 | 纵轴 | 对比方式 |
+|---|---|---|---|---|
+| 图 1：任务分数变化（点图） | 表 1 | 相对 Full KV 的分数差（百分点） | 任务及宏平均 | Stage 1、Stage 1 + Stage 2 各一个点；零线表示与 Full KV 持平 |
+| 图 2：首 token 延迟（折线图） | 表 2 | 实际输入长度，2K–32K | `ttft_ms / 1000`（秒） | 三种模式各一条线 |
+| 图 3：每步解码延迟（折线图） | 表 3 | 实际输入长度，2K–32K | `decode_ms_per_forward`（毫秒） | 三种模式各一条线，比较 HSA 从哪一档开始更快 |
+| 图 4a：保留的 KV（左图） | 表 4a | 实际输入长度，2K–32K | 逻辑 KV（MiB） | 三种模式各一条线 |
+| 图 4b：进程峰值（右图） | 表 4b | 实际输入长度，2K–32K | 峰值 RSS（MiB） | 三种模式各一条线，与左图对照 |
