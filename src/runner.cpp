@@ -26,6 +26,8 @@ struct PrefillActivations {
     int dim_head = 0;
     int num_heads = 0;
     int num_heads_kv = 0;
+    RocketMetal *metal = nullptr;
+    size_t host_bytes = 0;
     std::string error;
     bool enabled = false;
     bool capture_decode = false;
@@ -85,8 +87,14 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         return false;
     }
     try {
+        if (g_acts.metal) {
+            g_acts.metal->capture_prefill(t, is_q, offset);
+            offset += (int)t->ne[2];
+            return true;
+        }
         g_acts.raw_buf.resize(ggml_nbytes(t));
         ggml_backend_tensor_get(t, g_acts.raw_buf.data(), 0, g_acts.raw_buf.size());
+        g_acts.host_bytes += g_acts.raw_buf.size();
         for (int tok = 0; tok < t->ne[2]; ++tok) {
             for (int h = 0; h < n_heads; ++h) {
                 for (int d = 0; d < dim_head; ++d) {
@@ -143,6 +151,7 @@ struct RequestGuard {
     ~RequestGuard() {
         if (finished) return;
         g_acts.enabled = false;
+        g_acts.metal = nullptr;
         g_acts.capture_decode = false;
         llama_set_rocket_attention(ctx, nullptr, nullptr);
         llama_rocket_set_f32_reference(ctx, false);
@@ -181,6 +190,10 @@ struct InferenceOutput {
     std::vector<std::vector<std::vector<float>>> attention;
     std::vector<int> kept_positions;
     bool native_f32_reference = false;
+    std::string stage1_backend = "none";
+    std::string stage1_capture = "none";
+    size_t stage1_capture_host_bytes = 0;
+    int stage1_capture_metal_calls = 0;
 };
 
 static void run_warmup(llama_context * ctx, const llama_vocab * vocab) {
@@ -224,6 +237,7 @@ static InferenceOutput run_inference(
     int token_budget,
     RocketMode mode,
     RocketAdapter* adapter,
+    RocketMetal* prefill_metal,
     bool full_attention,
     bool trace_logits,
     bool native_f32_reference,
@@ -256,6 +270,8 @@ static InferenceOutput run_inference(
     llama_memory_t mem = llama_get_memory(ctx);
     clear_kv(ctx);
     g_acts.enabled = false;
+    g_acts.metal = nullptr;
+    g_acts.host_bytes = 0;
     g_acts.capture_decode = false;
     g_acts.error.clear();
     g_acts.q.clear();
@@ -323,13 +339,18 @@ static InferenceOutput run_inference(
     g_acts.dim_head = config.dim_head;
     g_acts.num_heads = config.num_heads;
     g_acts.num_heads_kv = config.num_heads_kv;
-    if (enable_rocket) {
+    const bool need_eviction = enable_rocket && n_tokens > config.prompt_budget;
+    if (need_eviction && !prefill_metal) {
         g_acts.q.assign((size_t)config.num_heads * n_tokens * config.dim_head, 0.0f);
         g_acts.k.assign((size_t)config.num_heads_kv * n_tokens * config.dim_head, 0.0f);
     }
-    g_acts.enabled = enable_rocket;
+    g_acts.enabled = need_eviction;
 
     int64_t t_start_prefill = ggml_time_us();
+    if (need_eviction && prefill_metal) {
+        prefill_metal->begin_prefill(n_tokens, n_tokens, config);
+        g_acts.metal = prefill_metal;
+    }
     if (llama_decode(ctx, batch) != 0) {
         throw std::runtime_error("Prefill failed: " + g_acts.error);
     }
@@ -339,7 +360,8 @@ static InferenceOutput run_inference(
 
     // Disable activation interception during decode
     g_acts.enabled = false;
-    if (enable_rocket && (!g_acts.error.empty() || g_acts.q_offset != n_tokens || g_acts.k_offset != n_tokens)) {
+    g_acts.metal = nullptr;
+    if (need_eviction && (!g_acts.error.empty() || g_acts.q_offset != n_tokens || g_acts.k_offset != n_tokens)) {
         throw std::runtime_error("Incomplete prefill Q/K capture: " + g_acts.error);
     }
 
@@ -348,11 +370,17 @@ static InferenceOutput run_inference(
     double evict_ms = 0.0;
     std::vector<int> kept_positions(n_tokens);
     std::iota(kept_positions.begin(), kept_positions.end(), 0);
-    if (enable_rocket && n_tokens > config.prompt_budget) {
+    if (need_eviction) {
         int64_t t_evict_start = ggml_time_us();
 
-        kept_positions = compute_prefill_eviction(
-            g_acts.q.data(), g_acts.k.data(), n_tokens, n_tokens, config);
+        out.stage1_backend = prefill_metal ? "metal" : "cpu";
+        const auto capture = prefill_metal ? prefill_metal->capture_stats() : RocketCaptureStats{};
+        out.stage1_capture = capture.metal_calls ? (capture.host_calls ? "mixed" : "metal") : "host";
+        out.stage1_capture_host_bytes = prefill_metal ? capture.host_bytes : g_acts.host_bytes;
+        out.stage1_capture_metal_calls = capture.metal_calls;
+        kept_positions = prefill_metal
+            ? prefill_metal->finish_prefill()
+            : compute_prefill_eviction(g_acts.q.data(), g_acts.k.data(), n_tokens, n_tokens, config);
 
         std::vector<bool> keep_mask(n_tokens, false);
         for (int idx : kept_positions) {
@@ -543,6 +571,10 @@ static nlohmann::json metrics_to_json(
         {"requested_mode", mode_name(mode)},
         {"effective_mode", mode_name(mode)},
         {"stage1_policy", mode == RocketMode::Off ? "none" : "legacy-global"},
+        {"stage1_backend", res.stage1_backend},
+        {"stage1_capture", res.stage1_capture},
+        {"stage1_capture_host_bytes", res.stage1_capture_host_bytes},
+        {"stage1_capture_metal_calls", res.stage1_capture_metal_calls},
         {"stage2_backend", mode == RocketMode::Hsa ? stage2_backend : "none"},
         {"hsa_full_attention", full_attention},
         {"native_f32_reference", res.native_f32_reference},
@@ -587,6 +619,7 @@ static int run_main(int argc, char ** argv) {
     int threads = 4;
     int ubatch = 1024;
     std::string stage2_backend = "cpu-reference";
+    std::string stage1_backend = "cpu";
     int n_ctx_override = 9216;
     int context_len_limit = 0;
     int window_size = 32;
@@ -610,6 +643,7 @@ static int run_main(int argc, char ** argv) {
                       << "  --threads N --ubatch N --gpu-layers N\n"
                       << "  HSA model placement: --gpu-layers 0 for CPU; positive values or -1 for Metal\n"
                       << "  --stage2-backend cpu-reference|metal (F16 KV; default cpu-reference)\n"
+                      << "  --stage1-backend cpu|metal   prefill scoring (default cpu; Top-K stays on CPU)\n"
                       << "  --hsa-full                   diagnostic: select all live candidates\n"
                       << "  --reference-f32              diagnostic native F32 decode, requires --trace-logits\n"
                       << "  --trace-logits               include token IDs/logits; allows batch forced_tokens\n";
@@ -643,6 +677,7 @@ static int run_main(int argc, char ** argv) {
         else if (arg == "--threads") threads = parse_integer(value());
         else if (arg == "--ubatch") ubatch = parse_integer(value());
         else if (arg == "--stage2-backend") stage2_backend = value();
+        else if (arg == "--stage1-backend") stage1_backend = value();
         else if (arg == "--hsa-full") full_attention = true;
         else if (arg == "--trace-logits") trace_logits = true;
         else if (arg == "--reference-f32") native_f32_reference = true;
@@ -660,6 +695,10 @@ static int run_main(int argc, char ** argv) {
         throw std::invalid_argument("Invalid budget, context, window, thread, or batch size");
     }
     if (stage2_backend != "cpu-reference" && stage2_backend != "metal") throw std::invalid_argument("Unknown stage2 backend");
+    if (stage1_backend != "cpu" && stage1_backend != "metal") throw std::invalid_argument("Unknown stage1 backend");
+    if (stage1_backend == "metal" && mode == RocketMode::Off) {
+        throw std::invalid_argument("Metal stage1 backend requires --rocket-mode stage1 or hsa");
+    }
     if (stage2_backend == "metal" && mode != RocketMode::Hsa) throw std::invalid_argument("Metal stage2 backend requires --rocket-mode hsa");
     if (full_attention && mode != RocketMode::Hsa) throw std::invalid_argument("--hsa-full requires --rocket-mode hsa");
     if (mode == RocketMode::Hsa) {
@@ -750,6 +789,8 @@ static int run_main(int argc, char ** argv) {
     config.kernel_size = kernel_size;
     std::unique_ptr<RocketAdapter> adapter;
     if (mode == RocketMode::Hsa) adapter = std::make_unique<RocketAdapter>(ctx, llama_model_n_layer(model), stage2_backend == "metal");
+    std::unique_ptr<RocketMetal> prefill_metal;
+    if (stage1_backend == "metal") prefill_metal = std::make_unique<RocketMetal>();
 
     float bytes_per_elem = 2.0f;
     if (kv_type == GGML_TYPE_Q8_0) bytes_per_elem = 34.0f / 32.0f;
@@ -775,7 +816,7 @@ static int run_main(int argc, char ** argv) {
 
             InferenceOutput res = run_inference(
                 ctx, model, vocab, ctx_params, config, prompt,
-                req_max_tokens, token_budget, mode, adapter.get(), full_attention, trace_logits, native_f32_reference, forced_tokens,
+                req_max_tokens, token_budget, mode, adapter.get(), prefill_metal.get(), full_attention, trace_logits, native_f32_reference, forced_tokens,
                 context_len_limit, bytes_per_elem, false
             );
 
@@ -784,6 +825,7 @@ static int run_main(int argc, char ** argv) {
             item_out["generated"] = res.text;
             item_out["status"] = "ok";
             item_out["metrics"] = metrics_to_json(res, kv_type_str, mode, token_budget, full_attention, stage2_backend);
+            item_out["metrics"]["requested_stage1_backend"] = stage1_backend;
             item_out["metrics"]["requested_gpu_layers"] = gpu_layers == -2
                 ? nlohmann::json(nullptr) : nlohmann::json(gpu_layers);
             item_out["metrics"]["model_backend"] = offloaded_hsa ? "metal" : (gpu_layers == 0 ? "cpu" : "auto");

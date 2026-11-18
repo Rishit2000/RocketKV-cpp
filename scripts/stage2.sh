@@ -15,11 +15,13 @@ test downloads a verified 1.1 MB model when no model is supplied.
 run creates a demonstration batch when BATCH.json is omitted.
 Results default to results/stage2/. GPU_LAYERS=99 uses Metal model offload;
 Set STAGE2_BACKEND=metal to also execute HSA attention on GPU.
+Set STAGE1_BACKEND=metal for GPU prefill scoring (Top-K and deletion stay on CPU).
 
 Build: JOBS=4 CXX=c++ METAL=ON|OFF (default: ON on macOS)
 Test:  SANITIZERS=undefined (ASan requires a compatible runtime)
 Run:   BUDGET=128 N_CTX=2048 CONTEXT_LEN=1024 MAX_TOKENS=32
-       WINDOW_SIZE=32 KERNEL_SIZE=63 THREADS=4 GPU_LAYERS=0 STAGE2_BACKEND=cpu-reference|metal
+       WINDOW_SIZE=32 KERNEL_SIZE=63 THREADS=4 GPU_LAYERS=0
+       STAGE1_BACKEND=cpu|metal STAGE2_BACKEND=cpu-reference|metal
 HELP
 }
 
@@ -167,9 +169,11 @@ PY
     fi
     for mode in off stage1 hsa; do
         backend=cpu-reference
+        prefill_backend=cpu
+        if [[ "$mode" != "off" ]]; then prefill_backend="${STAGE1_BACKEND:-cpu}"; fi
         if [[ "$mode" == "hsa" ]]; then backend="${STAGE2_BACKEND:-cpu-reference}"; fi
         "$ROOT/build/runner" --model "$MODEL" --batch "$INPUT" --output "$OUTPUT/$mode.json" \
-            --rocket-mode "$mode" --stage2-backend "$backend" --kv-type f16 --gpu-layers "${GPU_LAYERS:-0}" \
+            --rocket-mode "$mode" --stage1-backend "$prefill_backend" --stage2-backend "$backend" --kv-type f16 --gpu-layers "${GPU_LAYERS:-0}" \
             --budget "${BUDGET:-128}" --n-ctx "${N_CTX:-2048}" \
             --context-len "${CONTEXT_LEN:-1024}" --max-tokens "${MAX_TOKENS:-32}" \
             --window-size "${WINDOW_SIZE:-32}" --kernel-size "${KERNEL_SIZE:-63}" \
@@ -208,6 +212,7 @@ for mode in ("off", "stage1", "hsa"):
         raise SystemExit("No decode forward ran; use a different prompt or larger max_tokens")
 manifest = {
     "model": str(model), "batch": str(source), "stage2_backend": rows[0]["metrics"]["stage2_backend"],
+    "requested_stage1_backend": rows[0]["metrics"]["requested_stage1_backend"],
     "requested_gpu_layers": rows[0]["metrics"]["requested_gpu_layers"],
     "hsa_model_backend": rows[0]["metrics"]["model_backend"],
     "llama_revision": (root / "patches/llama.cpp-revision").read_text().strip(),

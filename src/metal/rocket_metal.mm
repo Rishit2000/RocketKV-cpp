@@ -30,7 +30,17 @@ enum Buffer {
     Error,
     BufferCount
 };
-enum Pipeline { Pack, Summarize, Prepare, Approximate, Softmax, Select, SelectLocal, Exact, WeightedSum, PipelineCount };
+enum Pipeline { Pack, Summarize, Prepare, Approximate, Softmax, Select, SelectLocal, Exact, WeightedSum,
+                PrefillPack, PrefillDot, PrefillSoftmax, PrefillReduce, PrefillPool, PrefillCapture, PipelineCount };
+enum PrefillBuffer { PrefillQ, PrefillK, PrefillPackedK, PrefillLogits, PrefillGroups,
+                     PrefillScores, PrefillError, PrefillRaw, PrefillBufferCount };
+struct PrefillParams {
+    uint32_t dim, heads, kv_heads, len_k, obs, count, pad;
+    float scale;
+};
+struct CaptureParams {
+    uint32_t heads, tokens, offset, total, sd, sh, st, type, is_query;
+};
 struct Params {
     uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded;
     uint32_t qd, qh, kd, kt, kh, vd, vt, vh;
@@ -67,6 +77,12 @@ struct RocketMetal::Impl {
     };
     std::vector<Cache> caches;
     Cache scratch;
+    std::array<id<MTLBuffer>, PrefillBufferCount> prefill_buffers{};
+    PrefillParams prefill_params{};
+    RocketConfig prefill_config{};
+    RocketCaptureStats capture_stats{};
+    int prefill_len_q = 0, captured_q = 0, captured_k = 0;
+    bool capturing = false;
     ggml_backend_metal_get_tensor_buffer_t get_tensor_buffer = nullptr;
     ggml_backend_metal_set_custom_t set_custom = nullptr;
     Impl() {
@@ -102,7 +118,8 @@ struct RocketMetal::Impl {
         }
         NSArray<NSString *> *names = @[
             @"pack", @"summarize", @"prepare", @"approximate", @"softmax", @"select_tokens", @"select_tokens_local", @"exact_scores",
-            @"weighted_sum"
+            @"weighted_sum", @"prefill_pack", @"prefill_dot", @"prefill_softmax",
+            @"prefill_reduce", @"prefill_pool", @"prefill_capture"
         ];
         for (size_t i = 0; i < pipelines.size(); ++i) {
             pipelines[i] = [device newComputePipelineStateWithFunction:[library newFunctionWithName:names[i]]
@@ -112,7 +129,8 @@ struct RocketMetal::Impl {
             }
         }
     }
-    void reserve(std::array<id<MTLBuffer>, BufferCount> &buffers, size_t index, size_t bytes, const void *source = nullptr) {
+    template <size_t N>
+    void reserve(std::array<id<MTLBuffer>, N> &buffers, size_t index, size_t bytes, const void *source = nullptr) {
         if (!buffers[index] || buffers[index].length < bytes) {
             const size_t capacity = std::max({bytes, size_t(4096), size_t(buffers[index].length) * 2});
             buffers[index] = [device newBufferWithLength:capacity options:MTLResourceStorageModeShared];
@@ -131,6 +149,41 @@ struct RocketMetal::Impl {
         return [buffer.device isEqual:device] && offset <= buffer.length &&
                ggml_nbytes(tensor) <= buffer.length - offset;
     }
+    void prepare_prefill(int len_q, int len_k, const RocketConfig &cfg, bool host_keys) {
+        capturing = false;
+        validate_prefill_config(len_q, len_k, cfg);
+        if (len_k <= cfg.prompt_budget) throw std::invalid_argument("Resident prefill requires eviction");
+        capture_stats = {};
+        captured_q = captured_k = 0;
+        prefill_len_q = len_q;
+        prefill_config = cfg;
+        auto &p = prefill_params;
+        p.dim = cfg.dim_head;
+        p.heads = cfg.num_heads;
+        p.kv_heads = cfg.num_heads_kv;
+        p.len_k = len_k;
+        p.obs = std::min(cfg.window_size, std::min(len_q, len_k));
+        p.count = len_k - p.obs;
+        p.pad = cfg.kernel_size / 2;
+        p.scale = 1.0f / std::sqrt(float(p.dim));
+        auto bytes = [&](size_t elements) {
+            if (elements > std::min(size_t(UINT32_MAX), size_t(device.maxBufferLength)) / sizeof(float)) {
+                throw std::invalid_argument("Metal Stage 1 scratch exceeds buffer/address limits");
+            }
+            return elements * sizeof(float);
+        };
+        const std::array<size_t, PrefillBufferCount> sizes{
+            bytes(size_t(p.heads) * p.obs * p.dim),
+            host_keys ? bytes(size_t(p.kv_heads) * p.len_k * p.dim) : 0,
+            bytes(size_t(p.kv_heads) * p.count * p.dim),
+            bytes(size_t(p.heads) * p.obs * p.count),
+            bytes(size_t(p.kv_heads) * p.count), bytes(p.count), sizeof(uint32_t), 0};
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (sizes[i]) reserve(prefill_buffers, i, sizes[i]);
+            else prefill_buffers[i] = nil;
+        }
+        *static_cast<uint32_t *>(prefill_buffers[PrefillError].contents) = 0;
+    }
 };
 
 RocketMetal::RocketMetal() {
@@ -143,6 +196,148 @@ RocketMetal::~RocketMetal() = default;
 void RocketMetal::reset() {
     impl_->caches.clear();
     impl_->scratch = {};
+    impl_->prefill_buffers = {};
+    impl_->capturing = false;
+    impl_->capture_stats = {};
+}
+
+void RocketMetal::begin_prefill(int len_q, int len_k, const RocketConfig &cfg) {
+    @autoreleasepool {
+        impl_->prepare_prefill(len_q, len_k, cfg, false);
+        impl_->capturing = true;
+    }
+}
+
+void RocketMetal::capture_prefill(const ggml_tensor *tensor, bool is_query, int offset) {
+    @autoreleasepool {
+        auto &m = *impl_;
+        const auto &p = m.prefill_params;
+        const int total = is_query ? m.prefill_len_q : int(p.len_k);
+        const uint32_t heads = is_query ? p.heads : p.kv_heads;
+        int &captured = is_query ? m.captured_q : m.captured_k;
+        if (!m.capturing || !tensor || !tensor->data || offset != captured ||
+            tensor->ne[0] != p.dim || tensor->ne[1] != heads || tensor->ne[3] != 1 ||
+            tensor->ne[2] <= 0 || tensor->ne[2] > total - captured ||
+            (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16)) {
+            throw std::invalid_argument("Invalid Metal prefill capture shape, type or offset");
+        }
+        const size_t span = ggml_nbytes(tensor);
+        if (span > UINT32_MAX || span > m.device.maxBufferLength) {
+            throw std::invalid_argument("Metal prefill capture exceeds buffer/address limits");
+        }
+        CaptureParams c{heads, uint32_t(tensor->ne[2]), uint32_t(offset), uint32_t(total),
+                        stride(tensor->nb[0]), stride(tensor->nb[1]), stride(tensor->nb[2]),
+                        tensor->type == GGML_TYPE_F32 ? 0u : (tensor->type == GGML_TYPE_F16 ? 1u : 2u),
+                        uint32_t(is_query)};
+        auto &b = m.prefill_buffers;
+        id<MTLBuffer> source = nil;
+        size_t source_offset = 0;
+        const bool direct = m.tensor_buffer(tensor, source, source_offset);
+        if (!direct) {
+            if (!(tensor->view_src ? tensor->view_src->buffer : tensor->buffer)) {
+                throw std::invalid_argument("Metal prefill capture requires a backend buffer");
+            }
+            m.reserve(b, PrefillRaw, span);
+            source = b[PrefillRaw];
+            ggml_backend_tensor_get(tensor, source.contents, 0, span);
+            m.capture_stats.host_calls++;
+            m.capture_stats.host_bytes += span;
+        } else {
+            m.capture_stats.metal_calls++;
+        }
+        id<MTLCommandBuffer> command = [m.queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!command || !encoder) throw std::runtime_error("Cannot encode Metal prefill capture");
+        [encoder setComputePipelineState:m.pipelines[PrefillCapture]];
+        [encoder setBytes:&p length:sizeof(p) atIndex:0];
+        for (size_t i = 0; i < b.size(); ++i) [encoder setBuffer:b[i] offset:0 atIndex:i + 1];
+        [encoder setBuffer:source offset:source_offset atIndex:8];
+        [encoder setBytes:&c length:sizeof(c) atIndex:9];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t(c.tokens) * heads * p.dim + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+        [command commit];
+        // The scheduler may overwrite the borrowed tensor as soon as the callback returns.
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            throw metal_error("Metal prefill capture command failed", command.error);
+        }
+        if (*static_cast<const uint32_t *>(b[PrefillError].contents)) {
+            throw std::runtime_error("Non-finite Metal prefill activation");
+        }
+        captured += int(c.tokens);
+    }
+}
+
+std::vector<int> RocketMetal::finish_prefill(std::vector<float> *importance) {
+    auto &m = *impl_;
+    if (!m.capturing || m.captured_q != m.prefill_len_q || m.captured_k != int(m.prefill_params.len_k)) {
+        throw std::runtime_error("Incomplete Metal prefill capture");
+    }
+    m.capturing = false;
+    return score_prefill(false, importance);
+}
+
+RocketCaptureStats RocketMetal::capture_stats() const {
+    return impl_->capture_stats;
+}
+
+std::vector<int> RocketMetal::prefill(const float *q, const float *k, int len_q, int len_k,
+                                     const RocketConfig &cfg, std::vector<float> *importance) {
+    @autoreleasepool {
+        validate_prefill_inputs(q, k, len_q, len_k, cfg);
+        if (len_k <= cfg.prompt_budget) {
+            return compute_prefill_eviction(q, k, len_q, len_k, cfg, importance);
+        }
+        auto &m = *impl_;
+        m.prepare_prefill(len_q, len_k, cfg, true);
+        const auto &p = m.prefill_params;
+        auto &b = m.prefill_buffers;
+        for (uint32_t h = 0; h < p.heads; ++h) {
+            std::memcpy(static_cast<float *>(b[PrefillQ].contents) + size_t(h) * p.obs * p.dim,
+                        q + (size_t(h) * len_q + len_q - p.obs) * p.dim,
+                        size_t(p.obs) * p.dim * sizeof(float));
+        }
+        std::memcpy(b[PrefillK].contents, k, size_t(p.kv_heads) * p.len_k * p.dim * sizeof(float));
+        return score_prefill(true, importance);
+    }
+}
+
+std::vector<int> RocketMetal::score_prefill(bool pack_keys, std::vector<float> *importance) {
+    @autoreleasepool {
+        if (importance) importance->clear();
+        auto &m = *impl_;
+        const auto &p = m.prefill_params;
+        auto &b = m.prefill_buffers;
+        id<MTLCommandBuffer> command = [m.queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!command || !encoder) throw std::runtime_error("Cannot encode Metal Stage 1");
+        [encoder setBytes:&p length:sizeof(p) atIndex:0];
+        for (size_t i = 0; i < b.size(); ++i) [encoder setBuffer:b[i] offset:0 atIndex:i + 1];
+        auto dispatch = [&](Pipeline pipeline, size_t groups) {
+            [encoder setComputePipelineState:m.pipelines[pipeline]];
+            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        };
+        if (pack_keys) dispatch(PrefillPack, (size_t(p.kv_heads) * p.count * p.dim + 255) / 256);
+        dispatch(PrefillDot, (size_t(p.heads) * p.obs * p.count + 255) / 256);
+        dispatch(PrefillSoftmax, size_t(p.heads) * p.obs);
+        dispatch(PrefillReduce, (size_t(p.kv_heads) * p.count + 255) / 256);
+        dispatch(PrefillPool, (p.count + 255) / 256);
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        if (command.status != MTLCommandBufferStatusCompleted) {
+            throw metal_error("Metal Stage 1 command failed", command.error);
+        }
+        if (*static_cast<const uint32_t *>(b[PrefillError].contents)) {
+            throw std::runtime_error("Non-finite Metal Stage 1 score");
+        }
+        const auto *output = static_cast<const float *>(b[PrefillScores].contents);
+        std::vector<float> scores(output, output + p.count);
+        if (importance) *importance = scores;
+        return select_prefill_tokens(scores, p.obs, m.prefill_config.prompt_budget);
+    }
 }
 
 bool RocketMetal::can_bind(const ggml_tensor *tensor) const {

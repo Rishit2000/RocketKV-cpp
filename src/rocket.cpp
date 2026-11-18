@@ -89,16 +89,34 @@ RocketBudgetParams compute_rocket_params(
     return p;
 }
 
-std::vector<int> compute_prefill_eviction(
-    const float* Q, const float* K, 
-    int len_q, int len_k, 
-    const RocketConfig& cfg) 
-{
+void validate_prefill_config(int len_q, int len_k, const RocketConfig& cfg) {
     validate_heads(cfg);
     if (len_q <= 0 || len_k <= 0 || cfg.window_size <= 0 || cfg.kernel_size <= 0 ||
         cfg.prompt_budget < std::min(cfg.window_size, std::min(len_q, len_k))) {
         throw std::invalid_argument("Invalid RocketKV prefill parameters");
     }
+    if (len_k > cfg.prompt_budget) {
+        checked_elements(cfg.num_heads, len_q, cfg.dim_head);
+        checked_elements(cfg.num_heads_kv, len_k, cfg.dim_head);
+    }
+}
+
+void validate_prefill_inputs(const float* Q, const float* K, int len_q, int len_k,
+                             const RocketConfig& cfg) {
+    validate_prefill_config(len_q, len_k, cfg);
+    if (len_k > cfg.prompt_budget) {
+        validate_values(Q, checked_elements(cfg.num_heads, len_q, cfg.dim_head), "Q");
+        validate_values(K, checked_elements(cfg.num_heads_kv, len_k, cfg.dim_head), "K");
+    }
+}
+
+std::vector<int> compute_prefill_eviction(
+    const float* Q, const float* K,
+    int len_q, int len_k,
+    const RocketConfig& cfg, std::vector<float>* importance)
+{
+    validate_prefill_inputs(Q, K, len_q, len_k, cfg);
+    if (importance) importance->clear();
     // If prompt is within budget, keep all tokens immediately
     if (len_k <= cfg.prompt_budget) {
         std::vector<int> kept_indices(len_k);
@@ -106,8 +124,6 @@ std::vector<int> compute_prefill_eviction(
         return kept_indices;
     }
 
-    validate_values(Q, checked_elements(cfg.num_heads, len_q, cfg.dim_head), "Q");
-    validate_values(K, checked_elements(cfg.num_heads_kv, len_k, cfg.dim_head), "K");
     int obs_w = std::min(cfg.window_size, std::min(len_q, len_k));
     int non_obs_k = len_k - obs_w;
     int heads_per_kv = cfg.num_heads / cfg.num_heads_kv;
@@ -198,24 +214,32 @@ std::vector<int> compute_prefill_eviction(
         }
     }
 
-    // Fast O(N) Selection of Top-K Survivors
-    int target_keep = std::max(0, cfg.prompt_budget - obs_w);
-    if (target_keep >= non_obs_k) {
-        std::vector<int> kept_indices(len_k);
-        for (int i = 0; i < len_k; ++i) kept_indices[i] = i;
-        return kept_indices;
-    }
-
-    std::vector<TokenScore> token_importance(non_obs_k);
-
+    std::vector<float> scores(non_obs_k);
     for (int i = 0; i < non_obs_k; ++i) {
         float total_score = 0.0f;
         for (int h_kv = 0; h_kv < cfg.num_heads_kv; ++h_kv) {
             total_score += pooled_scores[h_kv * non_obs_k + i];
         }
-        token_importance[i] = {total_score, i};
+        scores[i] = total_score;
     }
+    if (importance) *importance = scores;
+    return select_prefill_tokens(scores, obs_w, cfg.prompt_budget);
+}
 
+std::vector<int> select_prefill_tokens(const std::vector<float>& importance,
+                                     int obs_w, int prompt_budget) {
+    if (obs_w <= 0 || importance.size() > size_t(INT_MAX - obs_w) || prompt_budget < obs_w) {
+        throw std::invalid_argument("Invalid RocketKV prefill selection parameters");
+    }
+    const int non_obs_k = int(importance.size());
+    const int len_k = non_obs_k + obs_w;
+    const int target_keep = std::min(prompt_budget - obs_w, non_obs_k);
+    std::vector<TokenScore> token_importance(non_obs_k);
+    for (int i = 0; i < non_obs_k; ++i) {
+        if (!std::isfinite(importance[i])) throw std::runtime_error("Non-finite RocketKV prefill score");
+        token_importance[i] = {importance[i], i};
+    }
+    // Keep the existing comparator and input order, including equal-score behavior.
     std::nth_element(
         token_importance.begin(), 
         token_importance.begin() + target_keep, 
@@ -225,7 +249,7 @@ std::vector<int> compute_prefill_eviction(
 
     // Output chronologically sorted memory addresses
     std::vector<int> kept_indices;
-    kept_indices.reserve(cfg.prompt_budget);
+    kept_indices.reserve(target_keep + obs_w);
     for (int i = 0; i < target_keep; ++i) {
         kept_indices.push_back(token_importance[i].memory_idx);
     }
