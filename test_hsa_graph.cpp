@@ -1,4 +1,4 @@
-#include "hsa_graph.h"
+#include "llama-hsa.h"
 #include "rocket.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"

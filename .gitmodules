@@ -1,0 +1,4 @@
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = git@github.com:kworathur/llama.cpp.git
+	branch = rocketkv-hsa
