@@ -6,6 +6,9 @@ High-performance C++ implementation of **RocketKV** integrated with [`llama.cpp`
 
 ## Repository Structure
 
+For original Hugging Face safetensors conversion and the complete 16-task English
+LongBench run with both RocketKV stages, see [scripts/README.md](scripts/README.md).
+
 ```
 RocketKV-cpp/
 ├── rocket.h / rocket.cpp       # Core RocketKV eviction algorithms (C++17)

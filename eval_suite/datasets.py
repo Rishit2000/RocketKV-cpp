@@ -68,11 +68,12 @@ def load_longbench_dataset(task: str, num_samples: int = -1, context_len: int = 
     templates = load_prompt_templates()
     max_lens = load_task_max_lengths()
 
-    # Search paths for the JSONL dataset
+    # Search paths for the JSONL dataset (supports pytorch dataset/longbench and local data/longbench).
     candidates = [
         os.path.join(data_dir, "longbench", f"{task}.jsonl"),
         os.path.join(data_dir, f"{task}.jsonl"),
         os.path.join("data", "longbench", f"{task}.jsonl"),
+        os.path.join("dataset", "longbench", f"{task}.jsonl"),
         os.path.join("data", f"{task}.jsonl"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), f"../data/longbench/{task}.jsonl"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), f"../../data/longbench/{task}.jsonl"),
@@ -116,6 +117,7 @@ def load_longbench_dataset(task: str, num_samples: int = -1, context_len: int = 
                 "answers": answers,
                 "all_classes": all_classes,
                 "tokens_to_generate": tokens_to_generate,
+                "length": item.get("length", len(prompt)),
                 "context_length_chars": len(prompt),
                 "is_official": True
             })

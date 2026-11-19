@@ -40,6 +40,8 @@ def execute_runner_batch(
             "--model", model_path,
             "--kv-type", kv_type,
             "--rocket", "1" if enable_rocket else "0",
+            "--hsa", "1" if enable_rocket else "0",
+            "--hsa-skip", "0",
             "--n-ctx", str(n_ctx),
             "--context-len", str(context_len),
             "--batch", in_file,
@@ -57,7 +59,9 @@ def execute_runner_batch(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            env={key: value for key, value in os.environ.items()
+                 if key not in {"ROCKET_HSA", "ROCKET_HSA_SKIP"}}
         )
 
         for line in process.stderr:

@@ -1,0 +1,10 @@
+huggingface_hub>=0.34,<2
+transformers==4.57.6
+datasets>=2.14,<4
+rouge==1.0.1
+fuzzywuzzy==0.18.0
+python-Levenshtein>=0.27,<0.28
+jieba>=0.42
+numpy>=1.24
+pandas>=2.0
+tqdm>=4.66
