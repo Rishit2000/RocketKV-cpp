@@ -1,3 +1,4 @@
+#include <cfloat>
 #include "rocket.h"
 #include <iostream>
 #include <vector>
@@ -53,7 +54,117 @@ static std::vector<float> compute_exact_dense_decode(
     return out;
 }
 
+static double time_channel_slice_us(const float * Q, int len_k, const RocketConfig & cfg) {
+    const int H = std::max(1, cfg.num_heads / cfg.num_heads_kv);
+    const int D = cfg.dim_head;
+    const int chunk = (cfg.chunk_size > 0) ? cfg.chunk_size :
+        std::max(1, std::min((int)std::floor(cfg.compression_ratio),
+                             (int)std::ceil(std::sqrt(cfg.compression_ratio))));
+    int r = (cfg.r_dim > 0) ? cfg.r_dim :
+        std::min(D, std::max(1, (int)std::round((float)D * (float)chunk / cfg.compression_ratio)));
+    r = std::min(r, D);
+
+    auto once = [&]() {
+        float sink = 0.f;
+        #pragma omp parallel for reduction(+:sink)
+        for (int kv = 0; kv < cfg.num_heads_kv; ++kv) {
+            const float * q = Q + kv * H * D;
+            std::vector<float> abs_sum(D), val_sum(D, 0.f), sum_all(H, 0.f), sum_kept(H, 0.f);
+            for (int d = 0; d < D; ++d) {
+                float a = 0.f, s = 0.f;
+                for (int h = 0; h < H; ++h) {
+                    float v = q[h * D + d];
+                    a += std::fabs(v);
+                    s += v;
+                    sum_all[h] += std::fabs(v);
+                }
+                abs_sum[d] = a;
+                val_sum[d] = s;
+            }
+            std::vector<int> order(D);
+            for (int d = 0; d < D; ++d) order[d] = d;
+            std::nth_element(order.begin(), order.begin() + r, order.end(),
+                [&](int a, int b) { return abs_sum[a] > abs_sum[b]; });
+            for (int ri = 0; ri < r; ++ri) {
+                int d = order[ri];
+                sink += val_sum[d] > 0.f ? 1.f : -1.f;
+                for (int h = 0; h < H; ++h) sum_kept[h] += std::fabs(q[h * D + d]);
+            }
+            for (int h = 0; h < H; ++h) sink += sum_all[h] + sum_kept[h];
+        }
+        return sink;
+    };
+
+    once();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    volatile float keep = once();
+    (void)keep;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
+}
+
+// Independent token-expanded reference for the PyTorch single-token HSA path.
+static void test_hsa_token_softmax() {
+    RocketConfig cfg{};
+    cfg.num_heads = 4;
+    cfg.num_heads_kv = 2;
+    cfg.dim_head = 4;
+    cfg.chunk_size = 3;
+    cfg.r_dim = 2;
+    cfg.topk_decode = 2;
+    cfg.compression_ratio = 6;
+    std::mt19937 gen(932);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    for (int trial = 0; trial < 100; ++trial) {
+        const int n = 7 + trial % 3;
+        std::vector<float> q(16), k(8*n), v(8*n), expected(16, 0.f);
+        for (auto & x : q) x = normal(gen);
+        for (auto & x : k) x = normal(gen);
+        for (auto & x : v) x = normal(gen);
+        for (int kv = 0; kv < 2; ++kv) {
+            std::vector<int> dims{0,1,2,3};
+            auto importance = [&](int d) { return std::fabs(q[kv*8+d]) + std::fabs(q[kv*8+4+d]); };
+            std::sort(dims.begin(), dims.end(), [&](int a, int b) { return importance(a) > importance(b); });
+            std::vector<float> scores(n, 0.f);
+            for (int h = 0; h < 2; ++h) {
+                const float * qh = q.data() + kv*8+h*4;
+                float all = 0.f, kept = 0.f;
+                for (int d = 0; d < 4; ++d) all += std::fabs(qh[d]);
+                for (int ri = 0; ri < 2; ++ri) kept += std::fabs(qh[dims[ri]]);
+                const float scale = std::sqrt(4.f*kept/all);
+                std::vector<float> logits(n, 0.f);
+                for (int t = 0; t < n; ++t) {
+                    for (int ri = 0; ri < 2; ++ri) {
+                        int d = dims[ri];
+                        float sign = q[kv*8+d] + q[kv*8+4+d] > 0 ? 1.f : -1.f;
+                        float mx = -FLT_MAX;
+                        for (int j = t/3*3; j < std::min(n,t/3*3+3); ++j) mx = std::max(mx, sign*k[(kv*n+j)*4+d]);
+                        logits[t] += (qh[d]*sign)*mx/scale;
+                    }
+                }
+                float mx = *std::max_element(logits.begin(), logits.end()), denom = 0.f;
+                for (auto & x : logits) { x = std::exp(x-mx); denom += x; }
+                for (int t = 0; t < n; ++t) scores[t] += logits[t]/denom;
+            }
+            std::vector<int> rows(n);
+            for (int t = 0; t < n; ++t) rows[t] = t;
+            std::sort(rows.begin(), rows.end(), [&](int a, int b) { return scores[a] != scores[b] ? scores[a] > scores[b] : a < b; });
+            for (int h = 0; h < 2; ++h) {
+                float logits[2] = {};
+                for (int i = 0; i < 2; ++i) for (int d = 0; d < 4; ++d) logits[i] += q[kv*8+h*4+d]*k[(kv*n+rows[i])*4+d]/2.f;
+                float mx = std::max(logits[0], logits[1]);
+                float a = std::exp(logits[0]-mx), b = std::exp(logits[1]-mx);
+                for (int d = 0; d < 4; ++d) expected[kv*8+h*4+d] = (a*v[(kv*n+rows[0])*4+d]+b*v[(kv*n+rows[1])*4+d])/(a+b);
+            }
+        }
+        auto actual = compute_hybrid_sparse_decode(q.data(), k.data(), v.data(), n, cfg);
+        for (int i = 0; i < 16; ++i) assert(std::fabs(actual[i]-expected[i]) < 2e-5f);
+    }
+    std::cout << "Token-expanded HSA reference (100 GQA cases): PASS\n";
+}
+
 int main() {
+    test_hsa_token_softmax();
     std::cout << "========================================" << std::endl;
     std::cout << "RocketKV C++ Algorithmic Verification" << std::endl;
     std::cout << "========================================" << std::endl;
@@ -160,10 +271,14 @@ int main() {
     }
 
     // Compute RocketKV hybrid sparse decode across all GQA groups
+    double channel_us = time_channel_slice_us(Q_all.data(), decode_len_k, cfg);
     auto t_start_decode = std::chrono::high_resolution_clock::now();
     auto sparse_out = compute_hybrid_sparse_decode(Q_all.data(), K_decode.data(), V_decode.data(), decode_len_k, cfg);
     auto t_end_decode = std::chrono::high_resolution_clock::now();
     double decode_us = std::chrono::duration<double, std::micro>(t_end_decode - t_start_decode).count();
+
+    std::cout << "  Channel slice: " << channel_us << " us ("
+          << (100.0 * channel_us / decode_us) << "% of full HSA)\n";
 
     float cos_sim = cosine_similarity(exact_out, sparse_out);
     std::cout << "  Total Query heads evaluated: " << cfg.num_heads << " (" << cfg.num_heads_kv << " KV groups)" << std::endl;
@@ -187,12 +302,12 @@ int main() {
               << ", Prompt=" << p8k.prompt_budget << " (expected 3685)"
               << ", Top-k=" << p8k.k << " (expected 512)"
               << ", Chunk=" << p8k.chunk_size << " (expected 2)"
-              << ", r=" << p8k.r << " (expected 71)" << std::endl;
+              << ", r=" << p8k.r << " (expected 70)" << std::endl;
     assert(p8k.capacity_budget == 3717);
     assert(p8k.prompt_budget == 3685);
     assert(p8k.k == 512);
     assert(p8k.chunk_size == 2);
-    assert(p8k.r == 71);
+    assert(p8k.r == 70);
     std::cout << "  8K Sequence Budget Derivation: PASS" << std::endl;
 
     auto p16k = compute_rocket_params(1024, 16384, 32, 128);

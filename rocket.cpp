@@ -52,7 +52,7 @@ RocketBudgetParams compute_rocket_params(
     p.chunk_size = chunk_size;
     
     // Query dimension truncation
-    int r = std::min(head_dim, std::max(1, (int)std::round((float)head_dim * (float)chunk_size / cr_stage2)));
+    int r = std::min(head_dim, std::max(1, (int)((float)head_dim * (float)chunk_size / cr_stage2)));
     p.r = r;
     
     return p;
@@ -179,7 +179,7 @@ std::vector<float> compute_hybrid_sparse_decode(
     
     int num_chunks = (len_k + chunk_size - 1) / chunk_size;
     int r = (cfg.r_dim > 0) ? cfg.r_dim : 
-        std::min(cfg.dim_head, std::max(1, (int)std::round((float)cfg.dim_head * (float)chunk_size / cfg.compression_ratio)));
+        std::min(cfg.dim_head, std::max(1, (int)((float)cfg.dim_head * (float)chunk_size / cfg.compression_ratio)));
     r = std::min(r, cfg.dim_head);
     int final_k = std::min(cfg.topk_decode, len_k);
     std::vector<float> final_output(cfg.num_heads * cfg.dim_head, 0.0f);
@@ -199,6 +199,7 @@ std::vector<float> compute_hybrid_sparse_decode(
         std::vector<float> group_q_sum(cfg.dim_head, 0.0f);
         std::vector<float> sum_abs_all(heads_per_kv, 0.0f);
 
+        // for each query head in the group, compute the sum over all of its entries
         for (int d = 0; d < cfg.dim_head; ++d) {
             float sum_abs_d = 0.0f;
             float sum_val_d = 0.0f;
@@ -216,7 +217,8 @@ std::vector<float> compute_hybrid_sparse_decode(
         // Determine group consensus sign for key fetching
         std::vector<float> sign(cfg.dim_head);
         for (int d = 0; d < cfg.dim_head; ++d) {
-            sign[d] = (group_q_sum[d] >= 0.0f) ? 1.0f : -1.0f;
+            //note(keshav): to be consistent with the pytorch impl: set sign[d] = -1 if sum over query heads = 0
+            sign[d] = (group_q_sum[d] > 0.0f) ? 1.0f : -1.0f;
         }
 
         // Top-r dimension selection agreed upon by all query heads in the group
@@ -300,7 +302,8 @@ std::vector<float> compute_hybrid_sparse_decode(
             float sum_exp = 0.0f;
             for (int c = 0; c < num_chunks; ++c) {
                 chunk_probs[h * num_chunks + c] = std::exp(chunk_logits[h * num_chunks + c] - max_l);
-                sum_exp += chunk_probs[h * num_chunks + c];
+                // Softmax is over expanded tokens, including a partial final chunk.
+                sum_exp += chunk_probs[h * num_chunks + c] * std::min(chunk_size, len_k - c * chunk_size);
             }
             float inv_sum = 1.0f / (sum_exp + 1e-9f);
             for (int c = 0; c < num_chunks; ++c) {

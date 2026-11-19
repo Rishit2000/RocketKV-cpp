@@ -6,6 +6,9 @@ High-performance C++ implementation of **RocketKV** integrated with [`llama.cpp`
 
 ## Repository Structure
 
+For original Hugging Face safetensors conversion and the complete 16-task English
+LongBench run with both RocketKV stages, see [scripts/README.md](scripts/README.md).
+
 ```
 RocketKV-cpp/
 ├── rocket.h / rocket.cpp       # Core RocketKV eviction algorithms (C++17)
@@ -37,7 +40,7 @@ RocketKV-cpp/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/Rishit2000/RocketKV-cpp.git
+git clone --recurse-submodules https://github.com/Rishit2000/RocketKV-cpp.git
 cd RocketKV-cpp
 ```
 
@@ -58,19 +61,18 @@ pip install datasets transformers tiktoken numpy
 
 ---
 
-### 3. Clone and Build `llama.cpp`
+### 3. Initialize and Build the `llama.cpp` Fork
 
-RocketKV dynamically links against `llama.cpp` shared libraries. Clone and compile upstream `llama.cpp` with Metal support enabled:
+RocketKV dynamically links against the pinned [`kworathur/llama.cpp`](https://github.com/kworathur/llama.cpp) fork, which contains the HSA graph and CPU/Metal backend support. Initialize the submodule and build its shared libraries from the repository root:
 
 ```bash
-# Clone upstream llama.cpp
-git clone https://github.com/ggerganov/llama.cpp.git
+git submodule update --init --recursive
 
-# Build shared libraries with Metal acceleration
-cd llama.cpp
-cmake -B build -DGGML_METAL=ON -DBUILD_SHARED_LIBS=ON
-cmake --build build --config Release -j
-cd ..
+cmake -S llama.cpp -B llama.cpp/build \
+  -DGGML_METAL=ON -DBUILD_SHARED_LIBS=ON \
+  -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF \
+  -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF
+cmake --build llama.cpp/build --target llama --config Release -j
 ```
 
 ---

@@ -9,7 +9,7 @@
     "suite": "ruler",
     "tasks": ["niah_single_1"],
     "context_len": 8192,
-    "num_samples": 5
+    "num_samples": 1
   },
   "attention": {
     "attn_type": "all",

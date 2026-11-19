@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 
 // Captured Q and K activations of the target layer during prefill
@@ -22,10 +23,15 @@ struct PrefillActivations {
 
 static PrefillActivations g_acts;
 
+// Decode-time Q of the target layer for per-step HSA host selection.
+static std::vector<float> g_decode_q; // [n_heads * dim_head]
+static bool g_decode_q_enabled = false;
+static ggml_tensor * g_decode_q_tensor = nullptr;
+static int g_decode_q_dim = 0;
+static int g_decode_q_heads = 0;
+
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
-    if (!g_acts.enabled) return false;
-
     const char * name = t->name;
     if (!name) return false;
 
@@ -40,12 +46,27 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
         return false;
     }
 
-    if (ask) return true;
-
     int dim_head = t->ne[0];
     int n_heads = t->ne[1];
     int n_tokens_ubatch = t->ne[2];
-    if (n_tokens_ubatch <= 1) return true; // Prefill only
+
+    // Decode Q: mark tensor during ask; download after llama_synchronize (avoid mid-graph stall).
+    if (g_decode_q_enabled && is_q && n_tokens_ubatch == 1) {
+        if (ask) {
+            g_decode_q_tensor = t;
+            g_decode_q_dim = dim_head;
+            g_decode_q_heads = n_heads;
+            return true;
+        }
+        return true;
+    }
+
+    if (!g_acts.enabled) return false;
+    if (ask) return true;
+
+    if (n_tokens_ubatch <= 1) {
+        return true;
+    }
 
     int total_tokens = g_acts.total_prompt_tokens;
     int n_elem = ggml_nelements(t);
@@ -152,9 +173,12 @@ static InferenceOutput run_inference(
     int max_tokens,
     int token_budget,
     bool enable_rocket,
+    bool enable_hsa,
+    int hsa_skip_layers,
     int context_len_limit,
     float bytes_per_elem,
-    bool stream_stdout
+    bool stream_stdout,
+    bool ignore_eos
 ) {
     // Strict Isolation: ensure cache and activation buffers are completely clean
     llama_memory_t mem = llama_get_memory(ctx);
@@ -198,6 +222,19 @@ static InferenceOutput run_inference(
         config.compression_ratio = 1.0f;
         config.chunk_size = 0;
         config.r_dim = 0;
+    }
+
+    // Stage 2 scores each layer's current query against the live KV cache.
+    // Enable with --hsa 1 or ROCKET_HSA=1. Optional ROCKET_HSA_SKIP=N skips the first N layers.
+    if (enable_rocket && enable_hsa && config.chunk_size > 0 && config.r_dim > 0 && config.topk_decode > 0) {
+        int skip = hsa_skip_layers;
+        if (const char * env_skip = getenv("ROCKET_HSA_SKIP")) {
+            skip = atoi(env_skip);
+        }
+        llama_set_hsa_params(ctx, skip, config.chunk_size, config.r_dim, config.topk_decode);
+    } else {
+        llama_set_hsa_params(ctx, 0, 0, 0, 0);
+        llama_set_hsa_kv_rows(ctx, nullptr, 0);
     }
 
     llama_batch batch = llama_batch_init(n_tokens, 0, 1);
@@ -272,6 +309,12 @@ static InferenceOutput run_inference(
         evict_ms = (t_evict_end - t_evict_start) / 1000.0;
     }
 
+    if(enable_rocket && enable_hsa && config.chunk_size>0 && config.r_dim>0 && config.topk_decode>0) {
+        const int64_t start=ggml_time_us();
+        llama_hsa_kt_rebuild(ctx);
+        evict_ms+=(ggml_time_us()-start)/1000.0;
+    }
+
     // Release prefill activation buffers
     g_acts.q.clear();
     g_acts.k.clear();
@@ -288,10 +331,15 @@ static InferenceOutput run_inference(
     // Sample the initial token generated from the prefill prompt
     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
+    // Per-step HSA selection runs inside the decode graph.
+    g_decode_q_enabled = false;
+    g_decode_q_tensor = nullptr;
+    g_acts.enabled = false;
+
     int64_t t_start_decode = ggml_time_us();
 
     while (n_cur < ctx_params.n_ctx && n_decode_steps < max_tokens) {
-        if (llama_vocab_is_eog(vocab, new_token_id)) break;
+        if (!ignore_eos && llama_vocab_is_eog(vocab, new_token_id)) break;
 
         char piece_buf[256];
         int n_piece = llama_token_to_piece(vocab, new_token_id, piece_buf, sizeof(piece_buf), 0, true);
@@ -318,6 +366,9 @@ static InferenceOutput run_inference(
         n_cur++;
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
     }
+
+    g_decode_q_enabled = false;
+    g_decode_q_tensor = nullptr;
 
     int64_t t_end_decode = ggml_time_us();
 
@@ -402,17 +453,26 @@ int main(int argc, char ** argv) {
     int max_tokens = 128;
     int token_budget = 1024;
     bool enable_rocket = true;
+    bool ignore_eos = false;
     int n_ctx_override = 9216;
     int context_len_limit = 0;
     int window_size = 32;
     int kernel_size = 63;
+    // Default on with rocket; disable with --hsa 0 or ROCKET_HSA=0.
+    bool enable_hsa = true;
+    int hsa_skip_layers = 0;
     std::string batch_file = "";
     std::string output_file = "";
+
+    if (const char * env_hsa = getenv("ROCKET_HSA")) {
+        enable_hsa = (std::string(env_hsa) == "1" || std::string(env_hsa) == "true");
+    }
 
     // Argument parsing
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--model" && i + 1 < argc) model_path = argv[++i];
+        else if (arg == "--ignore-eos") ignore_eos = true;
         else if (arg == "--kv-type" && i + 1 < argc) kv_type_str = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) max_tokens = safe_stoi(argv[++i], max_tokens);
         else if ((arg == "--budget" || arg == "--token-budget") && i + 1 < argc) token_budget = safe_stoi(argv[++i], token_budget);
@@ -420,6 +480,11 @@ int main(int argc, char ** argv) {
             std::string v = argv[++i];
             enable_rocket = (v == "1" || v == "true");
         }
+        else if (arg == "--hsa" && i + 1 < argc) {
+            std::string v = argv[++i];
+            enable_hsa = (v == "1" || v == "true");
+        }
+        else if (arg == "--hsa-skip" && i + 1 < argc) hsa_skip_layers = safe_stoi(argv[++i], 0);
         else if (arg == "--n-ctx" && i + 1 < argc) n_ctx_override = safe_stoi(argv[++i], n_ctx_override);
         else if (arg == "--context-len" && i + 1 < argc) context_len_limit = safe_stoi(argv[++i], 0);
         else if (arg == "--window-size" && i + 1 < argc) window_size = safe_stoi(argv[++i], 32);
@@ -458,6 +523,8 @@ int main(int argc, char ** argv) {
 
     if (enable_rocket) {
         ctx_params.cb_eval = eval_callback;
+        // reserve extra nodes in the decode graph for storing rocketKV params
+        ctx_params.hsa_topk = 1;
     }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
@@ -510,14 +577,15 @@ int main(int argc, char ** argv) {
 
             InferenceOutput res = run_inference(
                 ctx, model, vocab, ctx_params, config, prompt,
-                req_max_tokens, token_budget, enable_rocket,
-                context_len_limit, bytes_per_elem, false
+                req_max_tokens, token_budget, enable_rocket, enable_hsa, hsa_skip_layers,
+                context_len_limit, bytes_per_elem, false, ignore_eos
             );
 
             nlohmann::json item_out;
             item_out["sample_id"] = item.value("sample_id", i + 1);
             item_out["generated"] = res.text;
             item_out["metrics"] = metrics_to_json(res, kv_type_str, enable_rocket, token_budget);
+            item_out["metrics"]["ignore_eos"] = ignore_eos;
             out_data.push_back(item_out);
 
             std::cerr << "    [" << (i + 1) << "/" << total << "] TTFT: "
