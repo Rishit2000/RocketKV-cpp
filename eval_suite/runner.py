@@ -53,11 +53,13 @@ def execute_runner_batch(
                 "--kernel-size", str(kernel_size)
             ])
 
+        runner_dir = os.path.dirname(os.path.abspath(runner_path))
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            cwd=runner_dir
         )
 
         for line in process.stderr:

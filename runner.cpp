@@ -1,26 +1,32 @@
 #include "llama.h"
 #include "rocket.h"
+#include "rocket_metal.h"
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <cstring>
+#include <sys/resource.h>
 #include <nlohmann/json.hpp>
 
-// Captured Q and K activations of the target layer during prefill
-struct PrefillActivations {
+// Captured Q, K, and V activations of the target layer during prefill and decode
+struct RocketActivations {
     int total_prompt_tokens = 0;
     int target_layer = -1;
     int q_offset = 0;
     int k_offset = 0;
+    int v_offset = 0;
     std::vector<float> q; // [num_heads, total_prompt_tokens, dim_head]
     std::vector<float> k; // [num_heads_kv, total_prompt_tokens, dim_head]
+    std::vector<float> v; // [num_heads_kv, total_prompt_tokens, dim_head]
+    std::vector<float> decode_q; // [num_heads, dim_head] for decode step
     std::vector<float> raw_buf;
     std::vector<ggml_fp16_t> fp16_buf;
     bool enabled = false;
+    bool is_decode = false;
 };
 
-static PrefillActivations g_acts;
+static RocketActivations g_acts;
 
 static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     (void)user_data;
@@ -29,23 +35,47 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     const char * name = t->name;
     if (!name) return false;
 
-    // Intercept post-RoPE Q and K tensors of the target layer
+    // Intercept post-RoPE Q and K tensors (and V tensors) of the target layer
     bool is_q = (std::strncmp(name, "Qcur-", 5) == 0);
     bool is_k = (std::strncmp(name, "Kcur-", 5) == 0);
-    if (!is_q && !is_k) return false;
-    if (t->op != GGML_OP_ROPE) return false;
+    bool is_v = (std::strncmp(name, "Vcur-", 5) == 0);
+    if (!is_q && !is_k && !is_v) return false;
 
     int layer_idx = std::atoi(name + 5);
     if (g_acts.target_layer >= 0 && layer_idx != g_acts.target_layer) {
         return false;
     }
 
+    if ((is_q || is_k) && t->op != GGML_OP_ROPE) return false;
+
     if (ask) return true;
 
     int dim_head = t->ne[0];
     int n_heads = t->ne[1];
     int n_tokens_ubatch = t->ne[2];
-    if (n_tokens_ubatch <= 1) return true; // Prefill only
+
+    // Decode phase interception for Stage 2 (single-token query)
+    if (g_acts.is_decode) {
+        if (n_tokens_ubatch == 1 && is_q) {
+            int n_elem = ggml_nelements(t);
+            if (g_acts.decode_q.size() < (size_t)n_elem) g_acts.decode_q.resize(n_elem);
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(t, g_acts.decode_q.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_F16) {
+                if (g_acts.fp16_buf.size() < (size_t)n_elem) g_acts.fp16_buf.resize(n_elem);
+                ggml_backend_tensor_get(t, g_acts.fp16_buf.data(), 0, ggml_nbytes(t));
+                ggml_fp16_to_fp32_row(g_acts.fp16_buf.data(), g_acts.decode_q.data(), n_elem);
+            } else if (t->type == GGML_TYPE_BF16) {
+                if (g_acts.fp16_buf.size() < (size_t)n_elem) g_acts.fp16_buf.resize(n_elem);
+                ggml_backend_tensor_get(t, g_acts.fp16_buf.data(), 0, ggml_nbytes(t));
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *)g_acts.fp16_buf.data(), g_acts.decode_q.data(), n_elem);
+            }
+        }
+        return true;
+    }
+
+    // Prefill phase interception (prompt tokens)
+    if (n_tokens_ubatch <= 1) return true;
 
     int total_tokens = g_acts.total_prompt_tokens;
     int n_elem = ggml_nelements(t);
@@ -75,8 +105,8 @@ static bool eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
     if (!src_data) return false;
 
     // Copy into contiguous layout [num_heads, total_prompt_tokens, dim_head]
-    auto & dst_buf = is_q ? g_acts.q : g_acts.k;
-    int & offset = is_q ? g_acts.q_offset : g_acts.k_offset;
+    auto & dst_buf = is_q ? g_acts.q : (is_k ? g_acts.k : g_acts.v);
+    int & offset = is_q ? g_acts.q_offset : (is_k ? g_acts.k_offset : g_acts.v_offset);
 
     for (int tok = 0; tok < n_tokens_ubatch; ++tok) {
         int target_tok = offset + tok;
@@ -99,16 +129,21 @@ static ggml_type get_kv_type(const std::string & type_str) {
 
 struct InferenceOutput {
     std::string text;
-    double ttft_ms = 0.0;       // User-facing TTFT: prefill + eviction
-    double prefill_ms = 0.0;    // Pure Metal GPU prefill latency
-    double evict_ms = 0.0;      // RocketKV Stage 1 eviction latency
-    double ms_per_tok = 0.0;    // Pure decode step latency
-    double tok_per_sec = 0.0;   // Generation throughput
-    int prompt_tokens = 0;      // Prompt length after truncation
-    int kept_tokens = 0;        // Surviving prompt tokens
-    int decode_tokens = 0;      // Number of generated tokens
-    double prompt_kv_mb = 0.0;  // Physical KV cache right after prefill/eviction
-    double uncompressed_mb = 0.0; // Uncompressed full KV baseline
+    double ttft_ms = 0.0;           // User-facing TTFT: prefill + eviction
+    double prefill_ms = 0.0;        // Pure Metal GPU prefill latency
+    double evict_ms = 0.0;          // RocketKV Stage 1 eviction latency
+    double decode_time_ms = 0.0;    // Pure decode phase latency
+    double compute_time_ms = 0.0;   // Total inference compute time: prefill + eviction + decode
+    double ms_per_tok = 0.0;        // Pure decode step latency
+    double tok_per_sec = 0.0;       // Generation throughput
+    double peak_memory_mb = 0.0;        // Peak process memory footprint (macOS getrusage)
+    double kv_traffic_mb_per_tok = 0.0; // Memory traffic transferred per decode step
+    double effective_bandwidth_gbs = 0.0;// Effective KV memory bandwidth (GB/s)
+    int prompt_tokens = 0;          // Prompt length after truncation
+    int kept_tokens = 0;            // Surviving prompt tokens
+    int decode_tokens = 0;          // Number of generated tokens
+    double prompt_kv_mb = 0.0;      // Physical KV cache right after prefill/eviction
+    double uncompressed_mb = 0.0;   // Uncompressed full KV baseline
 };
 
 static void run_warmup(llama_context * ctx, const llama_vocab * vocab) {
@@ -153,16 +188,22 @@ static InferenceOutput run_inference(
     int token_budget,
     bool enable_rocket,
     int context_len_limit,
-    float bytes_per_elem,
-    bool stream_stdout
+    float bytes_per_elem
 ) {
     // Strict Isolation: ensure cache and activation buffers are completely clean
     llama_memory_t mem = llama_get_memory(ctx);
     llama_memory_seq_rm(mem, -1, -1, -1);
     g_acts.q.clear();
     g_acts.k.clear();
+    g_acts.v.clear();
+    g_acts.decode_q.clear();
     g_acts.q_offset = 0;
     g_acts.k_offset = 0;
+    g_acts.v_offset = 0;
+    g_acts.enabled = false;
+    g_acts.is_decode = false;
+
+    bool run_stage2 = enable_rocket && is_rocket_metal_available();
 
     // Tokenize prompt
     std::vector<llama_token> tokens(prompt.length() + 32);
@@ -215,11 +256,16 @@ static InferenceOutput run_inference(
     g_acts.total_prompt_tokens = n_tokens;
     g_acts.q_offset = 0;
     g_acts.k_offset = 0;
+    g_acts.v_offset = 0;
     if (enable_rocket) {
         g_acts.q.assign(config.num_heads * n_tokens * config.dim_head, 0.0f);
         g_acts.k.assign(config.num_heads_kv * n_tokens * config.dim_head, 0.0f);
+        if (run_stage2) {
+            g_acts.v.assign(config.num_heads_kv * n_tokens * config.dim_head, 0.0f);
+        }
     }
     g_acts.enabled = enable_rocket;
+    g_acts.is_decode = false;
 
     int64_t t_start_prefill = ggml_time_us();
     if (llama_decode(ctx, batch) != 0) {
@@ -232,16 +278,17 @@ static InferenceOutput run_inference(
     llama_batch_free(batch);
     double prefill_ms = (t_end_prefill - t_start_prefill) / 1000.0;
 
-    // Disable activation interception during decode
+    // Disable activation interception after prefill
     g_acts.enabled = false;
 
     // --- ROCKETKV STAGE 1 EVICTION ---
+    std::vector<int> kept_indices;
     int evicted_count = 0;
     double evict_ms = 0.0;
     if (enable_rocket && n_tokens > config.prompt_budget && !g_acts.k.empty()) {
         int64_t t_evict_start = ggml_time_us();
 
-        std::vector<int> kept_indices = compute_prefill_eviction(
+        kept_indices = compute_prefill_eviction(
             g_acts.q.data(), g_acts.k.data(), n_tokens, n_tokens, config);
 
         std::vector<bool> keep_mask(n_tokens, false);
@@ -270,11 +317,43 @@ static InferenceOutput run_inference(
 
         int64_t t_evict_end = ggml_time_us();
         evict_ms = (t_evict_end - t_evict_start) / 1000.0;
+    } else if (enable_rocket) {
+        kept_indices.resize(n_tokens);
+        for (int i = 0; i < n_tokens; ++i) kept_indices[i] = i;
+    }
+
+    // Preserve kept K and V activations for Stage 2 Metal Sparse Attention
+    std::vector<float> kept_k;
+    std::vector<float> kept_v;
+    int n_kept = (int)kept_indices.size();
+    bool stage2_ready = false;
+    if (run_stage2 && n_kept > 0 && !g_acts.k.empty()) {
+        kept_k.resize(config.num_heads_kv * n_kept * config.dim_head);
+        kept_v.resize(config.num_heads_kv * n_kept * config.dim_head);
+        for (int h = 0; h < config.num_heads_kv; ++h) {
+            for (int i = 0; i < n_kept; ++i) {
+                int orig_idx = kept_indices[i];
+                const float * src_k = g_acts.k.data() + (h * n_tokens + orig_idx) * config.dim_head;
+                float * dst_k = kept_k.data() + (h * n_kept + i) * config.dim_head;
+                std::memcpy(dst_k, src_k, config.dim_head * sizeof(float));
+
+                const float * src_v = (!g_acts.v.empty()) ?
+                    (g_acts.v.data() + (h * n_tokens + orig_idx) * config.dim_head) : src_k;
+                float * dst_v = kept_v.data() + (h * n_kept + i) * config.dim_head;
+                std::memcpy(dst_v, src_v, config.dim_head * sizeof(float));
+            }
+        }
+        // One-time upload of kept K and V activations to Metal GPU buffer
+        rocket_metal_set_kv(kept_k.data(), kept_v.data(), n_kept, config);
+        stage2_ready = true;
+        kept_k.clear();
+        kept_v.clear();
     }
 
     // Release prefill activation buffers
     g_acts.q.clear();
     g_acts.k.clear();
+    g_acts.v.clear();
 
     double ttft_ms = prefill_ms + evict_ms;
 
@@ -289,6 +368,9 @@ static InferenceOutput run_inference(
     llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
     int64_t t_start_decode = ggml_time_us();
+    std::vector<float> stage2_out(config.num_heads * config.dim_head, 0.0f);
+    g_acts.enabled = run_stage2;
+    g_acts.is_decode = true;
 
     while (n_cur < ctx_params.n_ctx && n_decode_steps < max_tokens) {
         if (llama_vocab_is_eog(vocab, new_token_id)) break;
@@ -297,9 +379,6 @@ static InferenceOutput run_inference(
         int n_piece = llama_token_to_piece(vocab, new_token_id, piece_buf, sizeof(piece_buf), 0, true);
         if (n_piece > 0) {
             gen_text.append(piece_buf, n_piece);
-            if (stream_stdout) {
-                std::cout.write(piece_buf, n_piece);
-            }
         }
 
         n_decode_steps++;
@@ -315,15 +394,19 @@ static InferenceOutput run_inference(
         if (llama_decode(ctx, batch_decode) != 0) break;
         llama_synchronize(ctx);
 
+        // Execute RocketKV Stage 2 Hybrid Sparse Attention on Apple M4 GPU (zero host copy overhead)
+        if (stage2_ready && !g_acts.decode_q.empty()) {
+            rocket_metal_sparse_decode_step(
+                g_acts.decode_q.data(), stage2_out.data(), (int)kept_indices.size(), config);
+        }
+
         n_cur++;
         new_token_id = llama_sampler_sample(smpl, ctx, -1);
     }
+    g_acts.enabled = false;
+    g_acts.is_decode = false;
 
     int64_t t_end_decode = ggml_time_us();
-
-    if (stream_stdout) {
-        std::cout.flush();
-    }
 
     llama_batch_free(batch_decode);
     llama_sampler_free(smpl);
@@ -331,6 +414,7 @@ static InferenceOutput run_inference(
     double decode_time_ms = (t_end_decode - t_start_decode) / 1000.0;
     double ms_per_tok = (n_decode_steps > 0) ? (decode_time_ms / n_decode_steps) : 0.0;
     double tok_per_sec = (decode_time_ms > 0) ? (n_decode_steps / (decode_time_ms / 1000.0)) : 0.0;
+    double compute_time_ms = prefill_ms + evict_ms + decode_time_ms;
 
     int model_n_layer = llama_model_n_layer(model);
     int model_n_head_kv = llama_model_n_head_kv(model);
@@ -342,13 +426,33 @@ static InferenceOutput run_inference(
     // Clean KV cache
     llama_memory_seq_rm(mem, -1, -1, -1);
 
+    // Peak memory footprint queried via macOS getrusage (ru_maxrss in bytes)
+    struct rusage usage;
+    double peak_memory_mb = 0.0;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        peak_memory_mb = (double)usage.ru_maxrss / (1024.0 * 1024.0);
+    }
+
+    // Memory traffic & bandwidth per decode step
+    double attended_tokens = (run_stage2 && config.topk_decode > 0) ? 
+        (double)std::min(config.topk_decode, final_kept) : (double)final_kept;
+    double kv_traffic_bytes = attended_tokens * bytes_per_tok;
+    double kv_traffic_mb_per_tok = kv_traffic_bytes / (1024.0 * 1024.0);
+    double effective_bandwidth_gbs = (ms_per_tok > 0.0) ? 
+        (kv_traffic_bytes / ((ms_per_tok / 1000.0) * 1e9)) : 0.0;
+
     InferenceOutput out{};
     out.text = gen_text;
     out.ttft_ms = ttft_ms;
     out.prefill_ms = prefill_ms;
     out.evict_ms = evict_ms;
+    out.decode_time_ms = decode_time_ms;
+    out.compute_time_ms = compute_time_ms;
     out.ms_per_tok = ms_per_tok;
     out.tok_per_sec = tok_per_sec;
+    out.peak_memory_mb = peak_memory_mb;
+    out.kv_traffic_mb_per_tok = kv_traffic_mb_per_tok;
+    out.effective_bandwidth_gbs = effective_bandwidth_gbs;
     out.prompt_tokens = n_tokens;
     out.kept_tokens = final_kept;
     out.decode_tokens = n_decode_steps;
@@ -375,8 +479,13 @@ static nlohmann::json metrics_to_json(
         {"ttft_ms", res.ttft_ms},
         {"prefill_ms", res.prefill_ms},
         {"evict_ms", res.evict_ms},
+        {"decode_time_ms", res.decode_time_ms},
+        {"compute_time_ms", res.compute_time_ms},
         {"ms_per_token", res.ms_per_tok},
         {"tokens_per_sec", res.tok_per_sec},
+        {"peak_memory_mb", res.peak_memory_mb},
+        {"kv_traffic_mb_per_token", res.kv_traffic_mb_per_tok},
+        {"effective_bandwidth_gbs", res.effective_bandwidth_gbs},
         {"prompt_tokens", res.prompt_tokens},
         {"kept_tokens", res.kept_tokens},
         {"decode_tokens", res.decode_tokens},
@@ -436,6 +545,20 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (batch_file.empty()) {
+        std::cerr << "Error: Batch file must be specified with --batch <file>.\n";
+        return 1;
+    }
+
+    // Initialize RocketKV Metal GPU backend (Stage 2) by default whenever RocketKV is enabled
+    if (enable_rocket) {
+        if (!rocket_metal_init()) {
+            std::cerr << "[Warning] Failed to initialize RocketKV Metal GPU backend; running Stage 1 only.\n";
+        } else {
+            std::cerr << "[RocketKV] Metal GPU Shader initialized successfully (Stage 1 + Stage 2 active).\n";
+        }
+    }
+
     ggml_type kv_type = get_kv_type(kv_type_str);
 
     llama_backend_init();
@@ -487,49 +610,56 @@ int main(int argc, char ** argv) {
     else if (kv_type == GGML_TYPE_Q4_0) bytes_per_elem = 18.0f / 32.0f;
     else if (kv_type == GGML_TYPE_F32) bytes_per_elem = 4.0f;
 
-    if (!batch_file.empty()) {
-        std::ifstream f(batch_file);
-        if (!f.is_open()) {
-            std::cerr << "Error: Could not open batch file: " << batch_file << "\n";
-            llama_free(ctx);
-            llama_model_free(model);
-            llama_backend_free();
-            return 1;
+    std::ifstream f(batch_file);
+    if (!f.is_open()) {
+        std::cerr << "Error: Could not open batch file: " << batch_file << "\n";
+        if (enable_rocket && is_rocket_metal_available()) {
+            rocket_metal_cleanup();
         }
-        nlohmann::json in_data;
-        f >> in_data;
-        nlohmann::json out_data = nlohmann::json::array();
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
+    nlohmann::json in_data;
+    f >> in_data;
+    nlohmann::json out_data = nlohmann::json::array();
 
-        int total = in_data.size();
-        //std::cerr << "\n>>> Processing batch of " << total << " samples (" << kv_type_str << ", rocket=" << (enable_rocket ? "1" : "0") << ") <<<\n";
+    int total = in_data.size();
 
-        for (int i = 0; i < total; ++i) {
-            const auto & item = in_data[i];
-            std::string prompt = item["prompt"];
-            int req_max_tokens = item.value("max_tokens", max_tokens);
+    for (int i = 0; i < total; ++i) {
+        const auto & item = in_data[i];
+        std::string prompt = item["prompt"];
+        int req_max_tokens = item.value("max_tokens", max_tokens);
 
-            InferenceOutput res = run_inference(
-                ctx, model, vocab, ctx_params, config, prompt,
-                req_max_tokens, token_budget, enable_rocket,
-                context_len_limit, bytes_per_elem, false
-            );
+        InferenceOutput res = run_inference(
+            ctx, model, vocab, ctx_params, config, prompt,
+            req_max_tokens, token_budget, enable_rocket,
+            context_len_limit, bytes_per_elem
+        );
 
-            nlohmann::json item_out;
-            item_out["sample_id"] = item.value("sample_id", i + 1);
-            item_out["generated"] = res.text;
-            item_out["metrics"] = metrics_to_json(res, kv_type_str, enable_rocket, token_budget);
-            out_data.push_back(item_out);
+        nlohmann::json item_out;
+        item_out["sample_id"] = item.value("sample_id", i + 1);
+        item_out["generated"] = res.text;
+        item_out["metrics"] = metrics_to_json(res, kv_type_str, enable_rocket, token_budget);
+        out_data.push_back(item_out);
 
-            std::cerr << "    [" << (i + 1) << "/" << total << "] TTFT: "
-                      << (int)res.ttft_ms << "ms (prefill: " << (int)res.prefill_ms
-                      << "ms, evict: " << (int)res.evict_ms << "ms) | Decode: "
-                      << res.tok_per_sec << " tok/s | Kept: "
-                      << res.kept_tokens << "/" << res.prompt_tokens << "\n";
-        }
+        std::cerr << "    [" << (i + 1) << "/" << total << "] TTFT: "
+                  << (int)res.ttft_ms << "ms (prefill: " << (int)res.prefill_ms
+                  << "ms, evict: " << (int)res.evict_ms << "ms) | Compute: "
+                  << (int)res.compute_time_ms << "ms | Decode: "
+                  << res.tok_per_sec << " tok/s ("
+                  << (int)res.effective_bandwidth_gbs << " GB/s) | Kept: "
+                  << res.kept_tokens << "/" << res.prompt_tokens
+                  << " | Peak Mem: " << (int)res.peak_memory_mb << " MB\n";
+    }
 
-        std::ofstream out_f(output_file.empty() ? "batch_results.json" : output_file);
-        out_f << out_data.dump(2) << std::endl;
-        std::cerr << "Batch completed successfully!" << "\n";
+    std::ofstream out_f(output_file.empty() ? "batch_results.json" : output_file);
+    out_f << out_data.dump(2) << std::endl;
+    std::cerr << "Batch completed successfully!" << "\n";
+
+    if (enable_rocket && is_rocket_metal_available()) {
+        rocket_metal_cleanup();
     }
 
     llama_free(ctx);

@@ -31,7 +31,6 @@ from .config import (
 
 from .engine import (
     run_evaluation,
-    print_task_comparison_table,
     ALL_LONGBENCH_TASKS,
     LONGBENCH_EN_TASKS,
     LONGBENCH_ZH_TASKS,
@@ -56,7 +55,6 @@ __all__ = [
     "load_config_file",
     "build_attention_modes",
     "run_evaluation",
-    "print_task_comparison_table",
     "ALL_LONGBENCH_TASKS",
     "LONGBENCH_EN_TASKS",
     "LONGBENCH_ZH_TASKS",
