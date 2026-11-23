@@ -180,8 +180,7 @@ struct InferenceOutput {
     double prompt_kv_mb = 0.0;  // Logical prompt KV estimate, not allocated memory
     double uncompressed_mb = 0.0; // Uncompressed full KV baseline
     double stage2_init_ms = 0.0;
-    double decode_forward_ms = 0.0;
-    int decode_forward_calls = 0;
+    std::vector<double> decode_step_ms; // Each decode forward: llama_decode + sync + HSA checks
     int model_layers = 0;
     RocketConfig config{};
     RocketStage2Stats stage2;
@@ -242,6 +241,7 @@ static InferenceOutput run_inference(
     bool trace_logits,
     bool native_f32_reference,
     const std::vector<llama_token>& forced_tokens,
+    bool ignore_eos,
     int context_len_limit,
     float bytes_per_elem,
     bool stream_stdout
@@ -252,8 +252,8 @@ static InferenceOutput run_inference(
         throw std::invalid_argument("Invalid generation length or HSA configuration");
     }
     if (!forced_tokens.empty()) {
-        if (!trace_logits || forced_tokens.size() != (size_t)max_tokens) {
-            throw std::invalid_argument("forced_tokens requires --trace-logits and max_tokens entries");
+        if (forced_tokens.size() != (size_t)max_tokens) {
+            throw std::invalid_argument("forced_tokens requires max_tokens entries");
         }
         for (auto token : forced_tokens) {
             if (token < 0 || token >= llama_vocab_n_tokens(vocab) || llama_vocab_is_eog(vocab, token)) {
@@ -451,7 +451,7 @@ static InferenceOutput run_inference(
     int64_t t_start_decode = ggml_time_us();
 
     while ((int64_t)n_cur < ctx_params.n_ctx && n_decode_steps < max_tokens) {
-        if (llama_vocab_is_eog(vocab, new_token_id)) break;
+        if (!ignore_eos && llama_vocab_is_eog(vocab, new_token_id)) break;
         if (trace_logits) out.token_ids.push_back(new_token_id);
 
         char piece_buf[256];
@@ -481,8 +481,7 @@ static InferenceOutput run_inference(
         llama_synchronize(ctx);
         if (enable_hsa) adapter->finish_step();
         if (!g_acts.error.empty()) throw std::runtime_error(g_acts.error);
-        out.decode_forward_ms += (ggml_time_us() - forward_start) / 1000.0;
-        ++out.decode_forward_calls;
+        out.decode_step_ms.push_back((ggml_time_us() - forward_start) / 1000.0);
         if (trace_logits) {
             for (const auto& layer_output : g_acts.attention) {
                 if (layer_output.empty()) throw std::runtime_error("Missing decode attention trace");
@@ -553,6 +552,8 @@ static nlohmann::json metrics_to_json(
     bool full_attention,
     const std::string& stage2_backend
 ) {
+    const auto& steps = res.decode_step_ms;
+    const double forward_ms = std::accumulate(steps.begin(), steps.end(), 0.0);
     return {
         {"ttft_ms", res.ttft_ms},
         {"prefill_ms", res.prefill_ms},
@@ -589,10 +590,11 @@ static nlohmann::json metrics_to_json(
         {"stage2_r", res.config.r_dim},
         {"stage2_chunk", res.config.chunk_size},
         {"model_layers", res.model_layers},
-        {"decode_forward_calls", res.decode_forward_calls},
-        {"decode_forward_ms", res.decode_forward_ms},
-        {"decode_ms_per_forward", res.decode_forward_calls > 0
-            ? nlohmann::json(res.decode_forward_ms / res.decode_forward_calls) : nlohmann::json(nullptr)}
+        {"decode_forward_calls", steps.size()},
+        {"decode_forward_ms", forward_ms},
+        {"decode_ms_per_forward", steps.empty() ? nlohmann::json(nullptr) : nlohmann::json(forward_ms / steps.size())},
+        {"first_decode_ms", steps.empty() ? nlohmann::json(nullptr) : nlohmann::json(steps.front())},
+        {"decode_step_ms", steps}
     };
 }
 
@@ -614,6 +616,7 @@ static int run_main(int argc, char ** argv) {
     bool mode_seen = false;
     bool full_attention = false;
     bool trace_logits = false;
+    bool ignore_eos = false;
     bool native_f32_reference = false;
     int gpu_layers = -2;
     int threads = 4;
@@ -646,7 +649,9 @@ static int run_main(int argc, char ** argv) {
                       << "  --stage1-backend cpu|metal   prefill scoring (default cpu; Top-K stays on CPU)\n"
                       << "  --hsa-full                   diagnostic: select all live candidates\n"
                       << "  --reference-f32              diagnostic native F32 decode, requires --trace-logits\n"
-                      << "  --trace-logits               include token IDs/logits; allows batch forced_tokens\n";
+                      << "  --trace-logits               include token IDs, logits, and decode attention\n"
+                      << "  --ignore-eos                 keep generating max_tokens after an end-of-generation token\n"
+                      << "  Batch items may set forced_tokens (max_tokens non-EOG IDs) to fix the decode inputs\n";
             return 0;
         }
         if (arg == "--model") model_path = value();
@@ -680,6 +685,7 @@ static int run_main(int argc, char ** argv) {
         else if (arg == "--stage1-backend") stage1_backend = value();
         else if (arg == "--hsa-full") full_attention = true;
         else if (arg == "--trace-logits") trace_logits = true;
+        else if (arg == "--ignore-eos") ignore_eos = true;
         else if (arg == "--reference-f32") native_f32_reference = true;
         else if (arg.rfind("--", 0) != 0 && model_path.empty()) {
             model_path = arg;
@@ -817,7 +823,7 @@ static int run_main(int argc, char ** argv) {
             InferenceOutput res = run_inference(
                 ctx, model, vocab, ctx_params, config, prompt,
                 req_max_tokens, token_budget, mode, adapter.get(), prefill_metal.get(), full_attention, trace_logits, native_f32_reference, forced_tokens,
-                context_len_limit, bytes_per_elem, false
+                ignore_eos, context_len_limit, bytes_per_elem, false
             );
 
             nlohmann::json item_out;
