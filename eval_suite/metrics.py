@@ -1,7 +1,7 @@
 """
 Comprehensive metrics calculation module faithful to official LongBench & RULER evaluations.
-Matches RocketKV/eval/longbench_utils/metrics.py and eval_long_bench.py byte-for-byte in semantics,
-with pure-Python standard-library fallbacks for environments without external packages.
+LongBench metrics follow RocketKV/eval/longbench_utils/metrics.py and eval_long_bench.py;
+the English metrics require rouge and fuzzywuzzy (no silent fallbacks).
 """
 
 import re
@@ -153,67 +153,35 @@ def retrieval_zh_score(prediction: str, ground_truth: str, **kwargs) -> float:
 # ==============================================================================
 
 def code_sim_score(prediction: str, ground_truth: str, **kwargs) -> float:
-    """
-    Official LongBench Code Similarity Score (LCC, RepoBench-P).
-    Extracts first non-comment, non-backtick line and computes Levenshtein/edit ratio.
-    """
+    """Official LongBench code similarity (LCC, RepoBench-P): first line without `, # or //."""
+    from fuzzywuzzy import fuzz
     all_lines = prediction.lstrip('\n').split('\n')
-    pred_line = ""
+    prediction = ""
     for line in all_lines:
-        clean = line.strip()
-        if ('`' not in clean) and (not clean.startswith('#')) and (not clean.startswith('//')):
-            pred_line = line
+        if ('`' not in line) and ('#' not in line) and ('//' not in line):
+            prediction = line
             break
-    if not pred_line and all_lines:
-        pred_line = all_lines[0]
-
-    try:
-        from fuzzywuzzy import fuzz
-        return float(fuzz.ratio(pred_line, ground_truth) / 100.0)
-    except ImportError:
-        import difflib
-        return float(difflib.SequenceMatcher(None, pred_line, ground_truth).ratio())
+    return fuzz.ratio(prediction, ground_truth) / 100
 
 # ==============================================================================
 # Classification Metric
 # ==============================================================================
 
 def classification_score(prediction: str, ground_truth: str, **kwargs) -> float:
-    """
-    Official LongBench Classification Score (TREC, LSHT).
-    Finds matching class names from all_classes in prediction.
-    Penalizes ambiguity if multiple classes are output (1 / len(em_match_list)).
-    Falls back to closest class via edit similarity if no direct match is found.
-    """
-    all_classes = kwargs.get("all_classes")
-    if not all_classes:
-        return float(normalize_answer(ground_truth) in normalize_answer(prediction))
-
+    """Official LongBench classification score (TREC, LSHT), kept bug-for-bug: removal while
+    iterating can skip items, and `em_match_list != 0` is always true, so an output naming
+    no class scores 0 instead of falling back to the closest class."""
     em_match_list = []
+    all_classes = kwargs["all_classes"]
     for class_name in all_classes:
         if class_name in prediction:
             em_match_list.append(class_name)
-
-    for match_term in list(em_match_list):
+    for match_term in em_match_list:
         if match_term in ground_truth and match_term != ground_truth:
             em_match_list.remove(match_term)
-
-    if len(em_match_list) > 0:
-        if ground_truth in em_match_list:
-            score = 1.0 / len(em_match_list)
-        else:
-            score = 0.0
-    else:
-        import difflib
-        best_match = None
-        highest_similarity = 0.0
-        for candidate in all_classes:
-            similarity = difflib.SequenceMatcher(None, candidate, prediction).ratio()
-            if similarity > highest_similarity:
-                highest_similarity = similarity
-                best_match = candidate
-        score = float(best_match == ground_truth)
-    return float(score)
+    if ground_truth in em_match_list:
+        return 1.0 / len(em_match_list)
+    return 0.0
 
 # ==============================================================================
 # ROUGE-L Metrics
@@ -251,14 +219,13 @@ def _rouge_l_pure_python(prediction: str, ground_truth: str) -> float:
     return float(f)
 
 def rouge_score(prediction: str, ground_truth: str, **kwargs) -> float:
-    """Official LongBench ROUGE-L score for English summarization."""
+    """Official LongBench ROUGE-L F1 (pltrdy/rouge); any rouge error scores 0."""
+    from rouge import Rouge
     try:
-        from rouge import Rouge
-        rouge = Rouge()
-        scores = rouge.get_scores([prediction], [ground_truth], avg=True)
-        return float(scores["rouge-l"]["f"])
+        scores = Rouge().get_scores([prediction], [ground_truth], avg=True)
     except Exception:
-        return _rouge_l_pure_python(prediction, ground_truth)
+        return 0.0
+    return float(scores["rouge-l"]["f"])
 
 def rouge_zh_score(prediction: str, ground_truth: str, **kwargs) -> float:
     """Official LongBench ROUGE-L score for Chinese summarization."""
@@ -332,37 +299,6 @@ DATASET2METRIC = {
 
 FEW_SHOT_TASKS = {"trec", "triviaqa", "samsum", "lsht"}
 
-def clean_prediction(task: str, prediction: str) -> str:
-    """
-    Clean prompt continuation artifacts (Question:, Answer:, Passage:, etc.)
-    Faithful to official RocketKV/pipeline/model_utils.py post_process().
-    """
-    if not isinstance(prediction, str):
-        return str(prediction)
-
-    # Cut off if the model starts hallucinating subsequent QA pairs or prompt markers
-    for delimiter in [
-        "\n\nQuestion", "\nQuestion:", "\n\nQuestion:",
-        "\n\nAnswer", "\nAnswer:", "\n\nAnswer:",
-        "\n\nNote:", "\n\nNote",
-        "(Document", "(Passage", "[INST]", "[/INST]"
-    ]:
-        if delimiter in prediction:
-            prediction = prediction.split(delimiter)[0]
-
-    prediction = prediction.strip()
-
-    # For few-shot tasks, extract first line (matching official LongBench scorer)
-    if task in FEW_SHOT_TASKS:
-        prediction = prediction.lstrip('\n').split('\n')[0].strip()
-    elif task == "2wikimqa":
-        # 2wikimqa questions expect a single entity answer; if followed by commentary on next lines, take first non-empty line
-        lines = [l.strip() for l in prediction.split('\n') if l.strip()]
-        if lines:
-            prediction = lines[0]
-
-    return prediction
-
 def score_longbench_sample(
     task: str,
     prediction: str,
@@ -370,23 +306,36 @@ def score_longbench_sample(
     all_classes: Optional[List[str]] = None
 ) -> float:
     """
-    Score a single LongBench sample matching RocketKV/eval/longbench_utils/eval_long_bench.py scorer().
-    - Cleans prompt continuation artifacts via clean_prediction().
-    - Truncates to first line for few-shot tasks (trec, triviaqa, samsum, lsht).
-    - Evaluates against each reference in ground_truths and takes the max score.
+    Same as RocketKV eval/longbench_utils/eval_long_bench.py scorer() for one sample.
+    RocketKV's post_process() leaves llama3 outputs untouched, so the only cleanup is
+    keeping the first line for few-shot tasks; the score is the max over references.
     """
-    if not ground_truths:
-        return 0.0
-
-    prediction = clean_prediction(task, prediction)
-
-    metric_fn = DATASET2METRIC.get(task, qa_f1_score)
-    best_score = 0.0
+    if task in FEW_SHOT_TASKS:
+        prediction = prediction.lstrip('\n').split('\n')[0]
+    metric_fn = DATASET2METRIC[task]
+    score = 0.0
     for gt in ground_truths:
-        s = metric_fn(prediction, gt, all_classes=all_classes)
-        if s > best_score:
-            best_score = s
-    return float(best_score)
+        score = max(score, metric_fn(prediction, gt, all_classes=all_classes))
+    return float(score)
+
+# ==============================================================================
+# RULER metrics (RocketKV eval/ruler_utils/eval, i.e. official NVIDIA RULER)
+# ==============================================================================
+
+# qa_* use string_match_part; every other synthetic task uses string_match_all.
+RULER_PART_MATCH_TASKS = {"qa_1", "qa_2"}
+
+def postprocess_ruler_prediction(prediction: str) -> str:
+    """RULER evaluate.py postprocess_pred(): strip, map control characters to newlines."""
+    return re.sub(r'[\x00-\x1f]', '\n', prediction.strip()).strip()
+
+def score_ruler_sample(task: str, prediction: str, references: List[str]) -> float:
+    """Per-sample RULER score in [0, 1]; the task score is the mean x 100."""
+    if not references:
+        raise ValueError("RULER sample has no references")
+    pred = postprocess_ruler_prediction(prediction).lower()
+    hits = [1.0 if r.lower() in pred else 0.0 for r in references]
+    return max(hits) if task in RULER_PART_MATCH_TASKS else sum(hits) / len(hits)
 
 def score_sample(
     benchmark: str,
@@ -395,7 +344,7 @@ def score_sample(
     ground_truths: List[str],
     all_classes: Optional[List[str]] = None
 ) -> float:
-    """Unified sample scorer dispatching to RULER EM or LongBench official metrics."""
+    """Dispatch to the RULER or LongBench scorer."""
     if benchmark.lower() == "ruler":
-        return compute_exact_match(prediction, ground_truths)
+        return score_ruler_sample(task, prediction, ground_truths)
     return score_longbench_sample(task, prediction, ground_truths, all_classes=all_classes)

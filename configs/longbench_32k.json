@@ -1,0 +1,27 @@
+{
+  "_comment": "LongBench, the 16 English tasks RocketKV evaluates, all samples. Raw prompts are middle-truncated to 32k HF tokens (RocketKV: 127.5k) and wrapped in the llama3 chat template except trec/triviaqa/samsum/lcc/repobench-p.",
+  "model": {
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "tokenizer": "models/Llama-3.2-3B-Instruct-tokenizer",
+    "runner": "./build/runner"
+  },
+  "benchmark": {
+    "suite": "longbench",
+    "tasks": [
+      "narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique",
+      "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum",
+      "passage_retrieval_en", "passage_count", "lcc", "repobench-p"
+    ],
+    "context_len": 32768,
+    "num_samples": -1,
+    "chat_template": "llama3"
+  },
+  "attention": {
+    "budget": [512, 1024, 2048],
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "data_dir": "data"
+  }
+}

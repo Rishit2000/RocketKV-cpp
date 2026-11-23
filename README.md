@@ -2,7 +2,7 @@
 
 RocketKV reduces the KV cache used by single-sequence Llama inference in a pinned, patched `llama.cpp`. **Stage 1** evicts prompt tokens after prefill. **Stage 2** uses hybrid sparse attention (HSA) during decode: each layer and KV group selects from the retained candidates at each step. HSA requires F16 KV; model weights can be quantized.
 
-[Repository layout](#repository-layout) · [Inference pipeline](#inference-pipeline) · [Run LongBench](#run-longbench-on-metal) · [Results and resume](#read-and-resume-a-run) · [Development](#development)
+[Repository layout](#repository-layout) · [Inference pipeline](#inference-pipeline) · [Run LongBench and RULER](#run-longbench-and-ruler-on-metal) · [Results and resume](#read-and-resume-a-run) · [Development](#development)
 
 ## Repository layout
 
@@ -15,9 +15,13 @@ RocketKV-cpp/
 │   ├── rocket_adapter.cpp    Maps retained positions to live KV slots; connects HSA to GGML
 │   └── metal/                GPU kernels (.metal), dispatch (.mm), and non-Metal build stub
 ├── patches/                  Pinned llama.cpp revision, decode graph hooks, and Metal bridges
-├── scripts/                  Build, test, download, and benchmark entry points
+├── scripts/                  Shell entry points only
+│   ├── stage2.sh             Build, test, and demo-run the runner
+│   ├── data/                 Download the model and LongBench; generate official RULER inputs
+│   ├── eval/                 One script per benchmark experiment (longbench.sh, ruler.sh)
+│   └── bench/                Timing benchmarks
 ├── configs/                  Model paths, task lists, sample counts, and context limits
-├── eval_suite/               Dataset loaders, prompt templates, and scoring functions
+├── eval_suite/               Dataset loaders, prompt protocol, scoring, and the drivers the scripts call
 ├── eval.py                   Legacy LongBench/RULER evaluator (no Stage 2 HSA)
 ├── tests/                    CPU/Metal kernel tests and model integration tests
 ├── docs/                     Pipeline notes and benchmark reports
@@ -37,35 +41,33 @@ Local inputs and outputs are separate from source: `llama.cpp/` is the patched u
 
 `off` keeps the full cache and uses native decode attention. `stage1` evicts prompt KV but keeps native decode attention. `hsa` combines Stage 1 eviction with Stage 2 sparse decode.
 
-## Run LongBench on Metal
+## Run LongBench and RULER on Metal
 
-From the repository root on a Metal-capable Mac, build `build/runner` and prepare the evaluation environment. The build requires Git, CMake, Make, Python 3, and a C++17 compiler.
+From the repository root on a Metal-capable Mac, build `build/runner` and prepare the inputs. The build requires Git, CMake, Make, Python 3, and a C++17 compiler.
 
 ```bash
-conda env create -f environment.yml   # First setup only
+conda env create -f environment.yml    # First setup only
 conda activate rocketkv
 bash scripts/stage2.sh build
-bash scripts/download_model.sh       # Llama-3.2-3B-Instruct, Q8_0 weights
-bash scripts/download_longbench.sh   # JSONL files in data/longbench/
+bash scripts/data/download_model.sh     # Q8_0 GGUF weights + HF tokenizer in models/
+bash scripts/data/download_longbench.sh # official JSONL files in data/longbench/
+bash scripts/data/prepare_ruler.sh      # official RULER inputs in data/ruler/<len>/<task>/
 ```
 
-**Run both stages on Metal** (4 tasks, 30 samples each):
+`prepare_ruler.sh` runs the NVIDIA RULER generator vendored in [NVlabs/RocketKV](https://github.com/NVlabs/RocketKV) (`eval/ruler_utils`), cloned to `../RocketKV` unless `ROCKETKV_DIR` points elsewhere.
 
-```bash
-python3 scripts/run_longbench_stage2.py --config configs/longbench.json \
-  --mode hsa --stage1-backend metal --budget 1024 --output results/metal
-```
+| Experiment | Command | Inputs |
+|---|---|---|
+| LongBench | `bash scripts/eval/longbench.sh results/longbench_32k` | 16 English tasks, all samples, middle-truncated to 32k tokens |
+| RULER | `bash scripts/eval/ruler.sh results/ruler_5task` | `niah_single_2`, `niah_multikey_2`, `vt`, `fwe`, `qa_1`; 10 samples each at 2k/4k/8k/16k/32k |
 
-The scoring script sets F16 KV, requests Metal model offload, and selects Metal HSA in `hsa` mode. Keep `--stage1-backend metal` explicit: Stage 1 scoring defaults to CPU.
+Each command runs full KV once, then `stage1` and `hsa` for every budget in the config (512, 1024, 2048), with Metal Stage 1 scoring and Metal HSA. Add `--mode hsa`, `--budget 1024`, or `--dry-run` (load and format every input, print the plan, run nothing) after the output directory.
 
-| Experiment | Change to the command above |
-|---|---|
-| Compare full KV, Stage 1 only, and both stages | Replace `--mode hsa` with `--mode all` and use `--output results/metal-compare`. |
-| Run every sample of all 16 configured tasks | Use `--config configs/longbench_full.json` and a new output directory. All 16 task files must be present. |
+Prompts and scores follow the RocketKV paper code. LongBench prompts are middle-truncated with the HF tokenizer and wrapped in the llama3 chat template, except `trec`, `triviaqa`, `samsum`, `lcc`, and `repobench-p`; scoring is LongBench's `scorer()`. RULER inputs are used as generated (llama3 template and answer prefix included); every task generates up to 128 tokens and is scored with RULER's `string_match_all` (`string_match_part` for `qa_*`). As in RocketKV, chat-formatted prompts start with two BOS tokens. Differences from the paper are recorded in each config's `_comment`.
 
 ## Read and resume a run
 
-- `status.json` shows progress; `summary.json` reports scores and timings per task and mode.
+- `status.json` shows progress; `summary.json` reports scores and timings per run (`off`, `stage1_b1024`, ...) and task (`<len>/<task>` for RULER).
 - Each sample has a scored checkpoint and runner log. Wall time includes model startup; `ttft_ms` and `decode_ms_per_forward` measure inference. KV size is a logical estimate.
 - Re-run the same command to resume. The driver checks `manifest.json` against the inputs, settings, binary, driver hash, and Git commit. Use a new directory when these change.
 
@@ -78,7 +80,7 @@ For samples that evict prompt tokens, the dual-Metal run requires `stage1_captur
 | `make runner` | Rebuild `build/runner` after C++ changes. |
 | `ROCKET_TEST_METAL=1 bash scripts/stage2.sh test` | Run CPU and Metal checks, integration tests, and UBSan. |
 | `bash scripts/stage2.sh run MODEL.gguf` | Compare `off`, `stage1`, and `hsa` on a demo batch (CPU by default). |
-| `scripts/bench_stage1.py` | Measure Stage 1 capture and scoring separately from LongBench scoring. |
-| `python3 eval.py configs/ruler.json` | Run the legacy evaluator; its `rocket-kv` mode uses Stage 1 only. |
+| `bash scripts/bench/stage1.sh` | Measure Stage 1 capture and scoring separately from task scoring. |
+| `python3 eval.py configs/longbench.json` | Run the legacy evaluator; its `rocket-kv` mode uses Stage 1 only. RULER configs need `data/ruler/<len>/` from `prepare_ruler.sh`. |
 
 Further reading: [RocketKV paper](https://arxiv.org/abs/2502.14051) · [HSA optimization log](HSA_OPTIMIZATION_LOG.md).

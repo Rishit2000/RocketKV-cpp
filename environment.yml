@@ -8,10 +8,18 @@ dependencies:
   - make
   - pip
   - pip:
-      - datasets
       - transformers
+      - jinja2
       - tiktoken
       - numpy
       - rouge==1.0.1
       - fuzzywuzzy==0.18.0
       - python-Levenshtein==0.27.1
+      # RULER generation (RocketKV eval/ruler_utils)
+      - nltk
+      - wonderwords
+      - scipy
+      - tenacity
+      - pyyaml
+      - html2text
+      - beautifulsoup4

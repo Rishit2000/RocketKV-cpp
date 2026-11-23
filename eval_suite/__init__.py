@@ -1,6 +1,6 @@
 """
 eval_suite package initialization.
-Exports metrics, dataset generators, runner client, and evaluation engine.
+Exports metrics, dataset loaders, runner client, and evaluation engine.
 """
 
 from .metrics import (
@@ -12,13 +12,14 @@ from .metrics import (
     compute_retrieval_score,
     compute_count_score,
     score_longbench_sample,
+    score_ruler_sample,
     score_sample
 )
 
 from .datasets import (
-    load_paul_graham_essays,
-    generate_ruler_samples,
-    generate_longbench_samples
+    load_longbench_dataset,
+    load_ruler_dataset,
+    load_evaluation_samples
 )
 
 from .runner import execute_runner_batch
@@ -48,9 +49,10 @@ __all__ = [
     "compute_count_score",
     "score_longbench_sample",
     "score_sample",
-    "load_paul_graham_essays",
-    "generate_ruler_samples",
-    "generate_longbench_samples",
+    "score_ruler_sample",
+    "load_longbench_dataset",
+    "load_ruler_dataset",
+    "load_evaluation_samples",
     "execute_runner_batch",
     "DEFAULT_CONFIG",
     "load_config_file",

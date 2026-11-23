@@ -1,0 +1,24 @@
+{
+  "_comment": "Official RULER (NVlabs/RocketKV eval/ruler_utils) at 2k-32k, 5 of 13 tasks, 10 samples each. RocketKV paper: 13 tasks, 50 samples, 16k-96k. qa_1 (SQuAD) replaces qa_2 because the HotpotQA source returned HTTP 502 on 2026-11-23.",
+  "model": {
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "tokenizer": "models/Llama-3.2-3B-Instruct-tokenizer",
+    "runner": "./build/runner"
+  },
+  "benchmark": {
+    "suite": "ruler",
+    "tasks": ["niah_single_2", "niah_multikey_2", "vt", "fwe", "qa_1"],
+    "context_lens": [2048, 4096, 8192, 16384, 32768],
+    "num_samples": 10,
+    "max_new_tokens": 128,
+    "chat_template": "llama3"
+  },
+  "attention": {
+    "budget": [512, 1024, 2048],
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "data_dir": "data"
+  }
+}
