@@ -1,0 +1,42 @@
+{
+  "_comment": "Decode scaling over 1024 generated tokens at 128k for E0, E2, E4 (extension of configs/latency_long.json), 1 prompt, 1 repeat.",
+  "model": {
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "tokenizer": "models/Llama-3.2-3B-Instruct-tokenizer",
+    "runner": "./build/runner"
+  },
+  "latency": {
+    "task": "niah_single_2",
+    "lengths": [
+      131072
+    ],
+    "prompts": 1,
+    "repeats": 1,
+    "max_tokens": 1024,
+    "configs": [
+      {
+        "name": "E0_full",
+        "mode": "off"
+      },
+      {
+        "name": "E2_s1_metal",
+        "mode": "stage1",
+        "stage1_backend": "metal"
+      },
+      {
+        "name": "E4_hsa_metal",
+        "mode": "hsa",
+        "stage1_backend": "metal",
+        "stage2_backend": "metal"
+      }
+    ]
+  },
+  "attention": {
+    "budget": 1024,
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "data_dir": "data"
+  }
+}

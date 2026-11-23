@@ -1,0 +1,24 @@
+{
+  "_comment": "Official RULER at 64k and 128k (the model's trained context), same 5 tasks as configs/ruler_5task.json, 3 samples each: long-context extension of the benchmark (latency prompts and a small accuracy check).",
+  "model": {
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "tokenizer": "models/Llama-3.2-3B-Instruct-tokenizer",
+    "runner": "./build/runner"
+  },
+  "benchmark": {
+    "suite": "ruler",
+    "tasks": ["niah_single_2", "niah_multikey_2", "vt", "fwe", "qa_1"],
+    "context_lens": [65536, 131072],
+    "num_samples": 3,
+    "max_new_tokens": 128,
+    "chat_template": "llama3"
+  },
+  "attention": {
+    "budget": [1024],
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "data_dir": "data"
+  }
+}

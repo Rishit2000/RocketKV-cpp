@@ -12,6 +12,7 @@ Writes ROOT/report.md (and ROOT/figures/*.png when matplotlib is available) and 
 """
 import argparse
 import json
+import random
 from pathlib import Path
 import statistics
 
@@ -113,6 +114,48 @@ def accuracy_section(root):
     return out
 
 
+def paired_difference(base, other, units, resamples=2000, seed=0):
+    """Mean over units of mean(other - base) on shared samples, in points, with a 95% bootstrap
+    interval that resamples samples within each unit (task / length-task)."""
+    diffs = []
+    for unit in units:
+        shared = sorted(set(base.get(unit, {})) & set(other.get(unit, {})))
+        if shared:
+            diffs.append([100 * (other[unit][k]["score"] - base[unit][k]["score"]) for k in shared])
+    if not diffs:
+        return None
+    rng = random.Random(seed)
+    point = mean(mean(d) for d in diffs)
+    boot = sorted(mean(mean(rng.choices(d, k=len(d))) for d in diffs) for _ in range(resamples))
+    return point, boot[int(0.025 * resamples)], boot[int(0.975 * resamples) - 1]
+
+
+def fmt_ci(result):
+    return "—" if result is None else f"{result[0]:+.1f} [{result[1]:+.1f}, {result[2]:+.1f}]"
+
+
+def significance_section(root):
+    ruler = records(root / "ruler") if (root / "ruler").is_dir() else {}
+    longbench = records(root / "longbench") if (root / "longbench").is_dir() else {}
+    rows = []
+    for run in sorted((set(ruler) | set(longbench)) - {"off"}, key=run_key):
+        r_units = sorted(ruler.get(run, {}))
+        multikey = [u for u in r_units if u.endswith("/niah_multikey_2")]
+        rows.append(list(run_label(run)) + [
+            fmt_ci(paired_difference(ruler.get("off", {}), ruler.get(run, {}), r_units)) if run in ruler else "—",
+            fmt_ci(paired_difference(ruler.get("off", {}), ruler.get(run, {}), [u for u in r_units if u not in multikey]))
+            if run in ruler else "—",
+            fmt_ci(paired_difference(ruler.get("off", {}), ruler.get(run, {}), multikey)) if run in ruler else "—",
+            fmt_ci(paired_difference(longbench.get("off", {}), longbench.get(run, {}), sorted(longbench.get(run, {}))))
+            if run in longbench else "—"])
+    if not rows:
+        return []
+    return ["## Accuracy difference vs Full KV (points, 95% paired bootstrap CI)", "",
+            "Same samples as Full KV; 2000 resamples of samples within each task (RULER: each length-task). "
+            "An interval that contains 0 means no significant difference at this sample size.", "",
+            table(["Method", "Budget", "RULER all", "RULER w/o multikey", "RULER niah_multikey_2", "LongBench"], rows), ""]
+
+
 def consistency_section(root):
     if not (root / "ruler_cpu").is_dir() or not (root / "ruler").is_dir():
         return []
@@ -132,11 +175,29 @@ def consistency_section(root):
                   rows), ""] if rows else []
 
 
+def latency_summary(root):
+    """latency/ plus the optional 64k-128k extension latency_128k/ (fewer runs per cell)."""
+    summary = []
+    for name in ("latency", "latency_128k"):
+        path = root / name / "summary.json"
+        if path.is_file():
+            summary += json.loads(path.read_text())
+    return summary
+
+
+def long_runs(root):
+    """Per-run decode_step_ms series from latency_long/ and latency_long_128k/."""
+    out = []
+    for name in ("latency_long", "latency_long_128k"):
+        if (root / name / "runs").is_dir():
+            out += [json.loads(p.read_text()) for p in (root / name / "runs").glob("E*_r*.json")]
+    return out
+
+
 def latency_section(root):
-    path = root / "latency" / "summary.json"
-    if not path.is_file():
+    summary = latency_summary(root)
+    if not summary:
         return []
-    summary = json.loads(path.read_text())
     base = {s["length"]: s for s in summary if s["config"] == "E0_full"}
     order = list(LATENCY_NAMES)
     summary.sort(key=lambda s: (order.index(s["config"]) if s["config"] in order else 99, s["length"]))
@@ -153,9 +214,9 @@ def latency_section(root):
                        fmt(s["uncompressed_kv_cache_mb"], 0),
                        f"{s['uncompressed_kv_cache_mb'] / s['kv_cache_mb']:.1f}×" if s["kv_cache_mb"] else "—",
                        fmt(s["peak_rss_mb"], 0)])
-    runs = summary[0]["runs"] if summary else 0
+    runs = "/".join(str(n) for n in sorted({s["runs"] for s in summary}, reverse=True))
     return ["## Table C: latency (budget 1024, 128 generated tokens, medians)", "",
-            f"Each cell: {runs} runs (prompts × repeats). ITL = per decode step after the first; "
+            f"Each cell: {runs} runs (prompts × repeats; fewer at 64k-128k). ITL = per decode step after the first; "
             "speedups are Full KV / method for ITL p50 and end-to-end time.", "",
             table(["Method", "Length", "TTFT (ms)", "First decode (ms)", "ITL p50 (ms)", "ITL p99 (ms)",
                    "End-to-end (s)", "Decode (tok/s)", "ITL speedup", "E2E speedup"], rows), "",
@@ -169,12 +230,11 @@ def latency_section(root):
 
 
 def long_generation_section(root):
-    runs = root / "latency_long" / "runs"
-    if not runs.is_dir():
+    rows_in = long_runs(root)
+    if not rows_in:
         return []
     groups = {}
-    for path in runs.glob("E*_r*.json"):
-        r = json.loads(path.read_text())
+    for r in rows_in:
         groups.setdefault((r["config"], r["length"]), []).append(r["metrics"]["decode_step_ms"])
     windows = [(1, 128), (128, 512), (512, 1023)]
     rows = []
@@ -220,9 +280,10 @@ def figures(root):
     def label_end(ax, x, y, text):
         ax.annotate(text, (x, y), xytext=(6, 0), textcoords="offset points", va="center", fontsize=8, color="#3c3c39")
 
-    path = root / "latency" / "summary.json"
-    if path.is_file():
-        summary = json.loads(path.read_text())
+    summary = latency_summary(root)
+    if summary:
+        lengths = sorted({s["length"] for s in summary})
+        ticks = [n // 1024 for n in lengths]
         for metric, name, title, ylabel, configs, log in (
                 ("itl_p50_ms", "itl_vs_length", "Decode time per token vs context length (budget 1024)",
                  "ITL p50 (ms)", ["E0_full", "E2_s1_metal", "E4_hsa_metal"], False),
@@ -239,7 +300,7 @@ def figures(root):
                 if metric == "itl_p50_ms" and config in ("E0_full", "E4_hsa_metal"):
                     label_end(ax, xs[-1], ys[-1], f"{ys[-1]:.2f}")
             ax.set_xscale("log", base=2)
-            ax.set_xticks([2, 4, 8, 16, 32], ["2k", "4k", "8k", "16k", "32k"])
+            ax.set_xticks(ticks, [f"{t}k" for t in ticks])
             if log:
                 ax.set_yscale("log")
                 ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
@@ -291,12 +352,12 @@ def figures(root):
         ax.set_ylim(0, 100)
         finish(fig, ax, "accuracy_vs_budget", "Accuracy vs token budget (RULER 16k and 32k)")
 
-    runs = root / "latency_long" / "runs"
-    if runs.is_dir():
+    all_long = long_runs(root)
+    for n in sorted({r["length"] for r in all_long if r["length"] >= 32768}):
         series = {}
-        for path in runs.glob("E*_32768_*.json"):
-            r = json.loads(path.read_text())
-            series.setdefault(r["config"], []).append(r["metrics"]["decode_step_ms"])
+        for r in all_long:
+            if r["length"] == n:
+                series.setdefault(r["config"], []).append(r["metrics"]["decode_step_ms"])
         if series:
             fig, ax = plt.subplots(figsize=(6.4, 3.8))
             for config in [c for c in LATENCY_NAMES if c in series]:
@@ -307,7 +368,9 @@ def figures(root):
                 ax.plot(range(2, len(steps) + 2), smooth, color=color, label=LATENCY_NAMES[config])
             ax.set_xlabel("Decode step")
             ax.set_ylabel("ITL (ms, rolling mean of 32 steps)")
-            finish(fig, ax, "itl_long_generation", "Decode time per token over a 1024-token generation (32k input)")
+            suffix = "" if n == 32768 else f"_{n // 1024}k"
+            finish(fig, ax, f"itl_long_generation{suffix}",
+                   f"Decode time per token over a 1024-token generation ({n // 1024}k input)")
     return links
 
 
@@ -316,7 +379,7 @@ def main():
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
     sections = ["# RocketKV-cpp benchmark results", ""]
-    for part in (accuracy_section, consistency_section, latency_section, long_generation_section):
+    for part in (accuracy_section, significance_section, consistency_section, latency_section, long_generation_section):
         sections += part(args.root)
     text = "\n".join(sections)
     links = figures(args.root)
