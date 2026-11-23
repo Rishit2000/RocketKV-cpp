@@ -332,6 +332,15 @@ int main() {
     assert(p16k.r == 81);
     std::cout << "  16K Sequence Budget Derivation: PASS" << std::endl;
 
+    // Stage 2 alone: no eviction, compression ratio from the whole prompt (32768 / 1024 = 32).
+    auto p32k = compute_rocket_params(1024, 32768, 32, 128, 32, false);
+    assert(p32k.capacity_budget == 32768);
+    assert(p32k.prompt_budget == 32768);
+    assert(p32k.k == 512);
+    assert(p32k.chunk_size == 6);
+    assert(p32k.r == 24);
+    std::cout << "  32K Stage-2-only Derivation: PASS" << std::endl;
+
     std::cout << "\n[Test 4] Deterministic Sparse Attention Contract..." << std::endl;
     test_sparse_contract();
     test_prefill_key_tails();

@@ -43,7 +43,8 @@ RocketBudgetParams compute_rocket_params(
     int sequence_length, 
     int max_new_tokens, 
     int head_dim, 
-    int window_size) 
+    int window_size,
+    bool stage1) 
 {
     if (token_budget <= 0 || sequence_length <= 0 || max_new_tokens < 0 ||
         head_dim <= 0 || window_size <= 0) {
@@ -60,15 +61,16 @@ RocketBudgetParams compute_rocket_params(
     // Adaptive scaling exponent: alpha = min(0.2 + log2(CR) * 0.06, 0.8)
     float alpha = std::min(0.2f + std::log2(cr_initial) * 0.06f, 0.8f);
     
-    // Total capacity budget allowed across prompt + generation
+    // Total capacity budget allowed across prompt + generation; without Stage 1 the whole prompt.
     int capacity_budget = (int)std::floor((float)sequence_length / std::pow(cr_initial, alpha));
     capacity_budget = std::max(capacity_budget, (int)std::min(2LL * max_new_tokens, (long long)sequence_length));
+    if (!stage1) capacity_budget = sequence_length;
     p.capacity_budget = capacity_budget;
     
     // Prompt budget for Stage 1 prefill eviction
     int prompt_budget = std::min(sequence_length - max_new_tokens, capacity_budget - max_new_tokens);
     prompt_budget = std::clamp(prompt_budget, std::min(window_size, sequence_length), sequence_length);
-    p.prompt_budget = prompt_budget;
+    p.prompt_budget = stage1 ? prompt_budget : sequence_length;
     
     // Stage 2 decode top-k budget
     p.k = std::min((int)std::round((float)p.token_budget / 2.0f), capacity_budget);

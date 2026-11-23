@@ -130,12 +130,16 @@ static ggml_type get_kv_type(const std::string & type_str) {
     throw std::invalid_argument("Unsupported --kv-type: " + type_str);
 }
 
-enum class RocketMode { Off, Stage1, Hsa };
+// Stage2: HSA over the whole prompt without Stage 1 eviction (ablation).
+enum class RocketMode { Off, Stage1, Hsa, Stage2 };
 
 static const char* mode_name(RocketMode mode) {
     if (mode == RocketMode::Hsa) return "hsa";
+    if (mode == RocketMode::Stage2) return "stage2";
     return mode == RocketMode::Stage1 ? "stage1" : "off";
 }
+
+static bool uses_hsa(RocketMode mode) { return mode == RocketMode::Hsa || mode == RocketMode::Stage2; }
 
 struct BatchGuard {
     llama_batch batch;
@@ -247,7 +251,7 @@ static InferenceOutput run_inference(
     bool stream_stdout
 ) {
     const bool enable_rocket = mode != RocketMode::Off;
-    const bool enable_hsa = mode == RocketMode::Hsa;
+    const bool enable_hsa = uses_hsa(mode);
     if (max_tokens < 1 || (enable_hsa && (!adapter || token_budget <= 0))) {
         throw std::invalid_argument("Invalid generation length or HSA configuration");
     }
@@ -306,7 +310,8 @@ static InferenceOutput run_inference(
 
     // Compute budget parameters
     if (enable_rocket && token_budget > 0) {
-        RocketBudgetParams budget_params = compute_rocket_params(token_budget, n_tokens, max_tokens, config.dim_head, config.window_size);
+        RocketBudgetParams budget_params = compute_rocket_params(
+            token_budget, n_tokens, max_tokens, config.dim_head, config.window_size, mode != RocketMode::Stage2);
         config.prompt_budget = budget_params.prompt_budget;
         config.topk_decode = budget_params.k;
         config.compression_ratio = budget_params.compression_ratio;
@@ -571,12 +576,12 @@ static nlohmann::json metrics_to_json(
         {"kv_cache_measurement", "logical-estimate"},
         {"requested_mode", mode_name(mode)},
         {"effective_mode", mode_name(mode)},
-        {"stage1_policy", mode == RocketMode::Off ? "none" : "legacy-global"},
+        {"stage1_policy", mode == RocketMode::Off || mode == RocketMode::Stage2 ? "none" : "legacy-global"},
         {"stage1_backend", res.stage1_backend},
         {"stage1_capture", res.stage1_capture},
         {"stage1_capture_host_bytes", res.stage1_capture_host_bytes},
         {"stage1_capture_metal_calls", res.stage1_capture_metal_calls},
-        {"stage2_backend", mode == RocketMode::Hsa ? stage2_backend : "none"},
+        {"stage2_backend", uses_hsa(mode) ? stage2_backend : "none"},
         {"hsa_full_attention", full_attention},
         {"native_f32_reference", res.native_f32_reference},
         {"stage2_init_ms", res.stage2_init_ms},
@@ -639,7 +644,7 @@ static int run_main(int argc, char ** argv) {
         };
         if (arg == "--help") {
             std::cout << "Usage: runner --model MODEL --batch INPUT.json [--output OUTPUT.json]\n"
-                      << "  --rocket-mode off|stage1|hsa  (default: stage1)\n"
+                      << "  --rocket-mode off|stage1|hsa|stage2  (default: stage1; stage2 = HSA without Stage 1 eviction)\n"
                       << "  --rocket 0|1                 legacy mode; do not combine with --rocket-mode\n"
                       << "  --budget N --kv-type f16|q8_0|q4_0 --max-tokens N\n"
                       << "  --n-ctx N --context-len N --window-size N --kernel-size N\n"
@@ -669,6 +674,7 @@ static int run_main(int argc, char ** argv) {
             if (v == "off") mode = RocketMode::Off;
             else if (v == "stage1") mode = RocketMode::Stage1;
             else if (v == "hsa") mode = RocketMode::Hsa;
+            else if (v == "stage2") mode = RocketMode::Stage2;
             else throw std::invalid_argument("Invalid --rocket-mode: " + v);
             mode_seen = true;
         }
@@ -702,19 +708,19 @@ static int run_main(int argc, char ** argv) {
     }
     if (stage2_backend != "cpu-reference" && stage2_backend != "metal") throw std::invalid_argument("Unknown stage2 backend");
     if (stage1_backend != "cpu" && stage1_backend != "metal") throw std::invalid_argument("Unknown stage1 backend");
-    if (stage1_backend == "metal" && mode == RocketMode::Off) {
+    if (stage1_backend == "metal" && (mode == RocketMode::Off || mode == RocketMode::Stage2)) {
         throw std::invalid_argument("Metal stage1 backend requires --rocket-mode stage1 or hsa");
     }
-    if (stage2_backend == "metal" && mode != RocketMode::Hsa) throw std::invalid_argument("Metal stage2 backend requires --rocket-mode hsa");
-    if (full_attention && mode != RocketMode::Hsa) throw std::invalid_argument("--hsa-full requires --rocket-mode hsa");
-    if (mode == RocketMode::Hsa) {
+    if (stage2_backend == "metal" && !uses_hsa(mode)) throw std::invalid_argument("Metal stage2 backend requires --rocket-mode hsa or stage2");
+    if (full_attention && !uses_hsa(mode)) throw std::invalid_argument("--hsa-full requires --rocket-mode hsa or stage2");
+    if (uses_hsa(mode)) {
         if (kv_type_str != "f16" || token_budget < 1) {
             throw std::invalid_argument("HSA requires F16 KV and positive budget");
         }
         if (gpu_layers == -2) gpu_layers = stage2_backend == "metal" ? -1 : 0;
     }
     if (native_f32_reference) {
-        if (!trace_logits || mode == RocketMode::Hsa || kv_type_str != "f16" ||
+        if (!trace_logits || uses_hsa(mode) || kv_type_str != "f16" ||
             (gpu_layers != -2 && gpu_layers != 0)) {
             throw std::invalid_argument("--reference-f32 requires traced native attention, F16 KV, and CPU");
         }
@@ -730,7 +736,7 @@ static int run_main(int argc, char ** argv) {
     } backend_guard;
     llama_model_params model_params = llama_model_default_params();
     ggml_backend_dev_t metal_devices[] = {nullptr, nullptr};
-    const bool offloaded_hsa = mode == RocketMode::Hsa && gpu_layers != 0;
+    const bool offloaded_hsa = uses_hsa(mode) && gpu_layers != 0;
     if (offloaded_hsa) {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto device = ggml_backend_dev_get(i);
@@ -794,7 +800,7 @@ static int run_main(int argc, char ** argv) {
     config.window_size = window_size;
     config.kernel_size = kernel_size;
     std::unique_ptr<RocketAdapter> adapter;
-    if (mode == RocketMode::Hsa) adapter = std::make_unique<RocketAdapter>(ctx, llama_model_n_layer(model), stage2_backend == "metal");
+    if (uses_hsa(mode)) adapter = std::make_unique<RocketAdapter>(ctx, llama_model_n_layer(model), stage2_backend == "metal");
     std::unique_ptr<RocketMetal> prefill_metal;
     if (stage1_backend == "metal") prefill_metal = std::make_unique<RocketMetal>();
 

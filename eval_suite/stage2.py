@@ -27,7 +27,7 @@ from eval_suite.config import load_config_file
 from eval_suite.datasets import apply_longbench_protocol, load_longbench_dataset, load_ruler_dataset
 from eval_suite.metrics import score_longbench_sample, score_ruler_sample
 
-MODES = ("off", "stage1", "hsa")
+MODES = ("off", "stage1", "hsa", "stage2")  # stage2: HSA without Stage 1 eviction (ablation)
 N_CTX_MARGIN = 256  # chat template tokens and HF -> llama.cpp re-tokenization drift
 
 
@@ -87,7 +87,7 @@ def score(suite, task, record, sample):
 def check_backends(m, mode, stage1_backend, stage2_backend):
     if m["effective_mode"] != mode:
         raise RuntimeError("Runner used the wrong mode")
-    if mode != "off" and stage1_backend == "metal":
+    if mode in ("stage1", "hsa") and stage1_backend == "metal":
         if m["requested_stage1_backend"] != "metal":
             raise RuntimeError("Runner did not accept Metal Stage 1")
         if m["kept_tokens"] < m["prompt_tokens"] and (
@@ -95,7 +95,7 @@ def check_backends(m, mode, stage1_backend, stage2_backend):
             or m["stage1_capture_metal_calls"] < 1 or m["stage1_capture_host_bytes"] != 0
         ):
             raise RuntimeError("Stage 1 eviction did not use GPU-resident Metal capture and scoring")
-    if mode == "hsa" and (m["stage2_backend"] != stage2_backend or m["model_backend"] != "metal" or
+    if mode in ("hsa", "stage2") and (m["stage2_backend"] != stage2_backend or m["model_backend"] != "metal" or
                           m["stage2_layer_calls"] != m["model_layers"] * m["decode_forward_calls"]):
         raise RuntimeError(f"{stage2_backend} HSA did not execute in every layer")
 
@@ -220,11 +220,11 @@ def main():
                         source, target = directory / "input.json", directory / "pending.json"
                         save(source, request)
                         command = [str(runner), "--model", str(model), "--batch", str(source), "--output", str(target),
-                                   "--rocket-mode", mode, "--stage2-backend", args.stage2_backend if mode == "hsa" else "cpu-reference",
+                                   "--rocket-mode", mode, "--stage2-backend", args.stage2_backend if mode in ("hsa", "stage2") else "cpu-reference",
                                    "--kv-type", "f16", "--gpu-layers", "99", "--threads", str(args.threads),
                                    "--budget", str(budget or budgets[0]), "--n-ctx", str(n_ctx), "--context-len", "0",
                                    "--window-size", str(manifest["window_size"]), "--kernel-size", str(manifest["kernel_size"])]
-                        if mode != "off":
+                        if mode in ("stage1", "hsa"):
                             command.extend(["--stage1-backend", args.stage1_backend])
                         begin = time.monotonic()
                         with (directory / f"{key}.log").open("w") as log:

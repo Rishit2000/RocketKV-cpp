@@ -1,0 +1,44 @@
+{
+  "_comment": "Ablation: Stage 2 (HSA) alone over the whole prompt (E5, --rocket-mode stage2) against Stage 1+2 (E4), interleaved, 2k-128k, 1 RULER niah_single_2 prompt per length, 3 repeats, 128 tokens with --ignore-eos.",
+  "model": {
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "tokenizer": "models/Llama-3.2-3B-Instruct-tokenizer",
+    "runner": "./build/runner"
+  },
+  "latency": {
+    "task": "niah_single_2",
+    "lengths": [
+      2048,
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      131072
+    ],
+    "prompts": 1,
+    "repeats": 3,
+    "max_tokens": 128,
+    "configs": [
+      {
+        "name": "E4_hsa_metal",
+        "mode": "hsa",
+        "stage1_backend": "metal",
+        "stage2_backend": "metal"
+      },
+      {
+        "name": "E5_s2_metal",
+        "mode": "stage2",
+        "stage2_backend": "metal"
+      }
+    ]
+  },
+  "attention": {
+    "budget": 1024,
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "data_dir": "data"
+  }
+}

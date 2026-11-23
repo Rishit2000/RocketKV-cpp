@@ -38,7 +38,8 @@ RocketBudgetParams compute_rocket_params(
     int sequence_length, 
     int max_new_tokens, 
     int head_dim, 
-    int window_size = 32);
+    int window_size = 32,
+    bool stage1 = true);   // false: Stage 2 alone over the whole prompt (no prefill eviction)
 
 std::vector<int> compute_prefill_eviction(
     const float* Q, const float* K, 

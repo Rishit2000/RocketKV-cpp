@@ -696,6 +696,9 @@ int main(int argc, char **argv) {
         compare(metal, 96, 129, 2, 23);
         compare(metal, 256, 17, 2, 5);
         compare(metal, 16, 32768, 3, 17, true);
+        // Stage 2 without eviction: the whole 32k/128k context is the candidate set.
+        compare(metal, 128, 33000, 6, 512);
+        compare(metal, 128, 131200, 12, 512);
         compare(metal, 16, 8193, 1, 511);
         compare(metal, 17, 8193, 1, 8192, true);
         compare(metal, 64, 257, 3, 17, false, false, 1e-6f);

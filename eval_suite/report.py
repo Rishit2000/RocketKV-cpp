@@ -8,6 +8,8 @@ Expected subdirectories (any may be missing; its tables are skipped):
   longbench/     eval_suite.stage2, LongBench: off, stage1_b1024, hsa_b1024             (E0, E2, E4)
   latency/       eval_suite.latency summary.json                                         (E0-E4)
   latency_long/  eval_suite.latency summary.json and runs/ with 1024-token generations
+  ruler_128k/    RULER at 64k/128k: off, stage1_b1024, hsa_b1024 (3 samples per task)
+  ruler_stage2/, ruler_128k_stage2/, latency_stage2/   ablation E5: Stage 2 alone, stage2_b1024
 Writes ROOT/report.md (and ROOT/figures/*.png when matplotlib is available) and prints the tables.
 """
 import argparse
@@ -24,9 +26,10 @@ LONGBENCH_GROUPS = {
     "Synthetic": ["passage_count", "passage_retrieval_en"],
     "Code": ["lcc", "repobench-p"],
 }
-NAMES = {"off": "Full KV (E0)", "stage1": "Stage 1 (E2)", "hsa": "Stage 1+2 (E4)"}
+NAMES = {"off": "Full KV (E0)", "stage1": "Stage 1 (E2)", "hsa": "Stage 1+2 (E4)", "stage2": "Stage 2 only (E5)"}
 LATENCY_NAMES = {"E0_full": "Full KV (E0)", "E1_s1_cpu": "Stage 1 · CPU (E1)", "E2_s1_metal": "Stage 1 · Metal (E2)",
-                 "E3_hsa_cpu": "Stage 1+2 · CPU (E3)", "E4_hsa_metal": "Stage 1+2 · Metal (E4)"}
+                 "E3_hsa_cpu": "Stage 1+2 · CPU (E3)", "E4_hsa_metal": "Stage 1+2 · Metal (E4)",
+                 "E5_s2_metal": "Stage 2 only · Metal (E5)"}
 
 
 def table(header, rows):
@@ -175,6 +178,80 @@ def consistency_section(root):
                   rows), ""] if rows else []
 
 
+def merged_records(root, *names):
+    out = {}
+    for name in names:
+        if (root / name).is_dir():
+            for run, units in records(root / name).items():
+                out.setdefault(run, {}).update(units)
+    return out
+
+
+def ruler_compare(recs, base="off"):
+    """Rows of per-length mean, per-task mean and paired CIs vs `base` for every run in recs."""
+    by_length = ruler_by_length(recs)
+    lengths = sorted({n for v in by_length.values() for n in v})
+    tasks = sorted({u.split("/")[1] for v in recs.values() for u in v})
+    rows = []
+    for run in sorted(recs, key=run_key):
+        per_task = [mean(100 * mean(r["score"] for r in s.values()) for u, s in recs[run].items()
+                         if u.endswith("/" + t)) for t in tasks]
+        units = sorted(recs[run])
+        multikey = [u for u in units if u.endswith("/niah_multikey_2")]
+        cis = [fmt_ci(paired_difference(recs.get(base, {}), recs[run], us)) if run != base else "—"
+               for us in (units, [u for u in units if u not in multikey])]
+        rows.append(list(run_label(run)) + [fmt(by_length[run].get(n)) for n in lengths] +
+                    [fmt(mean(by_length[run].values()))] + [fmt(x) for x in per_task] + cis)
+    header = (["Method", "Budget"] + [f"{n // 1024}k" for n in lengths] + ["avg"] + tasks +
+              ["Δ vs Full KV", "Δ w/o multikey"])
+    return header, rows
+
+
+def long_context_section(root):
+    recs = merged_records(root, "ruler_128k", "ruler_128k_stage2")
+    if not recs:
+        return []
+    header, rows = ruler_compare(recs)
+    n = max(len(s) for units in recs.values() for s in units.values())
+    return ["## RULER at 64k and 128k (budget 1024)", "",
+            f"{n} samples per task and length, so a single sample moves a task score by {100 / n:.0f} points; "
+            "per-task columns are means over both lengths. Δ: points vs Full KV with 95% paired bootstrap CI.", "",
+            table(header, rows), ""]
+
+
+def ablation_section(root):
+    """E5 (Stage 2 alone, no eviction) against E0/E2/E4 on the same RULER samples, and its latency."""
+    if not (root / "ruler_stage2").is_dir() and not (root / "latency_stage2" / "summary.json").is_file():
+        return []
+    out = ["## Ablation: Stage 2 without Stage 1 eviction (E5, budget 1024)", "",
+           "E5 keeps the whole prompt in the KV cache and runs HSA over all of it (compression ratio "
+           "= prompt / budget, so larger chunks and fewer query dimensions than E4).", ""]
+    if (root / "ruler_stage2").is_dir():
+        recs = merged_records(root, "ruler", "ruler_stage2")
+        recs = {run: v for run, v in recs.items() if run in ("off", "stage1_b1024", "hsa_b1024", "stage2_b1024")}
+        header, rows = ruler_compare(recs)
+        out += ["RULER 2k-32k, same samples as Table A:", "", table(header, rows), ""]
+    path = root / "latency_stage2" / "summary.json"
+    if path.is_file():
+        summary = json.loads(path.read_text())
+        base = {s["length"]: s for s in latency_summary(root) if s["config"] == "E0_full"}
+        e4 = {s["length"]: s for s in summary if s["config"] == "E4_hsa_metal"}
+        rows = []
+        for s in sorted(summary, key=lambda s: (s["length"], s["config"])):
+            if s["config"] != "E5_s2_metal":
+                continue
+            n, b, other = s["length"], base.get(s["length"]), e4.get(s["length"])
+            rows.append([f"{n // 1024}k", fmt(b["itl_p50_ms"], 2) if b else "—",
+                         fmt(other["itl_p50_ms"], 2) if other else "—", fmt(s["itl_p50_ms"], 2),
+                         fmt(other["ttft_ms"], 0) if other else "—", fmt(s["ttft_ms"], 0),
+                         fmt(s["stage2_init_ms"], 1), fmt(s["kv_cache_mb"], 0)])
+        out += [f"Latency (E4 and E5 interleaved in one session, {summary[0]['runs']} runs per cell; "
+                "Full KV from Table C):", "",
+                table(["Length", "Full KV ITL p50", "E4 ITL p50", "E5 ITL p50", "E4 TTFT", "E5 TTFT",
+                       "E5 Stage 2 init", "E5 KV (MB)"], rows), ""]
+    return out
+
+
 def latency_summary(root):
     """latency/ plus the optional 64k-128k extension latency_128k/ (fewer runs per cell)."""
     summary = []
@@ -248,7 +325,7 @@ def long_generation_section(root):
 
 # One fixed color and marker per configuration in every figure (validated categorical slots 1-5).
 STYLE = {"E0_full": ("#2a78d6", "o"), "E1_s1_cpu": ("#eb6834", "s"), "E2_s1_metal": ("#1baf7a", "^"),
-         "E3_hsa_cpu": ("#eda100", "D"), "E4_hsa_metal": ("#e87ba4", "v")}
+         "E3_hsa_cpu": ("#eda100", "D"), "E4_hsa_metal": ("#e87ba4", "v"), "E5_s2_metal": ("#008300", "P")}
 RUN_CONFIG = {"off": "E0_full", "stage1": "E2_s1_metal", "hsa": "E4_hsa_metal"}
 
 
@@ -352,6 +429,26 @@ def figures(root):
         ax.set_ylim(0, 100)
         finish(fig, ax, "accuracy_vs_budget", "Accuracy vs token budget (RULER 16k and 32k)")
 
+    path = root / "latency_stage2" / "summary.json"
+    if path.is_file():
+        series = {"E0_full": [s for s in latency_summary(root) if s["config"] == "E0_full"]}
+        for s in json.loads(path.read_text()):
+            series.setdefault(s["config"], []).append(s)
+        fig, ax = plt.subplots(figsize=(6.4, 3.8))
+        for config in [c for c in LATENCY_NAMES if c in series]:
+            rows = sorted(series[config], key=lambda s: s["length"])
+            color, marker = STYLE[config]
+            xs, ys = [r["length"] // 1024 for r in rows], [r["itl_p50_ms"] for r in rows]
+            ax.plot(xs, ys, color=color, marker=marker, label=LATENCY_NAMES[config])
+            label_end(ax, xs[-1], ys[-1], f"{ys[-1]:.2f}")
+        ticks = sorted({r["length"] // 1024 for v in series.values() for r in v})
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(ticks, [f"{t}k" for t in ticks])
+        ax.set_ylim(bottom=0)
+        ax.set_xlabel("Context length (tokens)")
+        ax.set_ylabel("ITL p50 (ms)")
+        finish(fig, ax, "itl_stage2_ablation", "Decode time per token: Stage 2 with and without Stage 1")
+
     all_long = long_runs(root)
     for n in sorted({r["length"] for r in all_long if r["length"] >= 32768}):
         series = {}
@@ -379,7 +476,8 @@ def main():
     parser.add_argument("root", type=Path)
     args = parser.parse_args()
     sections = ["# RocketKV-cpp benchmark results", ""]
-    for part in (accuracy_section, significance_section, consistency_section, latency_section, long_generation_section):
+    for part in (accuracy_section, significance_section, consistency_section, latency_section, long_generation_section,
+                 long_context_section, ablation_section):
         sections += part(args.root)
     text = "\n".join(sections)
     links = figures(args.root)

@@ -377,10 +377,10 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         if (!q || !k || !v || !q->data || !k->data || !v->data || (!output && !dst) || q->type != GGML_TYPE_F32 ||
             k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || cfg.dim_head < 1 || cfg.dim_head > 256 ||
             cfg.num_heads_kv < 1 || cfg.num_heads < 1 || cfg.num_heads % cfg.num_heads_kv ||
-            cfg.num_heads / cfg.num_heads_kv > 8 || slots.empty() || slots.size() > 32768 ||
+            cfg.num_heads / cfg.num_heads_kv > 8 || slots.empty() || slots.size() > (1u << 20) ||
             cfg.chunk_size < 1 || cfg.r_dim < 1 || cfg.topk_decode < 1 || layer < -1) {
             throw std::invalid_argument(
-                "Metal HSA requires F32 Q/F16 KV, head dimension <=256, <=8 query heads per KV head and 1..32768 candidates");
+                "Metal HSA requires F32 Q/F16 KV, head dimension <=256, <=8 query heads per KV head and 1..2^20 candidates");
         }
         if (q->ne[0] != cfg.dim_head || q->ne[1] != 1 || q->ne[2] != cfg.num_heads || q->ne[3] != 1 ||
             k->ne[0] != cfg.dim_head || k->ne[2] != cfg.num_heads_kv || k->ne[3] != 1 ||

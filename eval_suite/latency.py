@@ -109,7 +109,7 @@ def main():
                    "--budget", str(c.get("budget", attention["budget"])), "--n-ctx",
                    str(n + bench["max_tokens"] + N_CTX_MARGIN), "--context-len", "0", "--ignore-eos",
                    "--window-size", str(attention["window_size"]), "--kernel-size", str(attention["kernel_size"])]
-        if c["mode"] != "off":
+        if c["mode"] in ("stage1", "hsa"):
             command += ["--stage1-backend", c["stage1_backend"]]
         result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
         (output / "runs" / f"{target.stem}.log").write_text(result.stdout + result.stderr)
