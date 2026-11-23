@@ -8,7 +8,7 @@ Expected subdirectories (any may be missing; its tables are skipped):
   longbench/     eval_suite.stage2, LongBench: off, stage1_b1024, hsa_b1024             (E0, E2, E4)
   latency/       eval_suite.latency summary.json                                         (E0-E4)
   latency_long/  eval_suite.latency summary.json and runs/ with 1024-token generations
-Writes ROOT/report.md and prints it.
+Writes ROOT/report.md (and ROOT/figures/*.png when matplotlib is available) and prints the tables.
 """
 import argparse
 import json
@@ -186,6 +186,129 @@ def long_generation_section(root):
             table(["Method", "Length"] + [f"steps {a + 1}-{b}" for a, b in windows] + ["Total decode (s)"], rows), ""]
 
 
+# One fixed color and marker per configuration in every figure (validated categorical slots 1-5).
+STYLE = {"E0_full": ("#2a78d6", "o"), "E1_s1_cpu": ("#eb6834", "s"), "E2_s1_metal": ("#1baf7a", "^"),
+         "E3_hsa_cpu": ("#eda100", "D"), "E4_hsa_metal": ("#e87ba4", "v")}
+RUN_CONFIG = {"off": "E0_full", "stage1": "E2_s1_metal", "hsa": "E4_hsa_metal"}
+
+
+def figures(root):
+    """PNG figures for the report; returns markdown image links."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker
+    except ImportError:
+        return []
+    plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
+                         "axes.grid": True, "grid.color": "#e6e6e3", "grid.linewidth": 0.8,
+                         "axes.edgecolor": "#8a8a85", "axes.labelcolor": "#3c3c39", "xtick.color": "#5c5c58",
+                         "ytick.color": "#5c5c58", "lines.linewidth": 2, "lines.markersize": 7})
+    out_dir = root / "figures"
+    out_dir.mkdir(exist_ok=True)
+    links = []
+
+    def finish(fig, ax, name, title):
+        ax.set_title(title, loc="left", fontsize=11, color="#1f1f1d")
+        ax.legend(frameon=False, fontsize=9)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{name}.png", dpi=200)
+        plt.close(fig)
+        links.append(f"![{title}](figures/{name}.png)")
+
+    def label_end(ax, x, y, text):
+        ax.annotate(text, (x, y), xytext=(6, 0), textcoords="offset points", va="center", fontsize=8, color="#3c3c39")
+
+    path = root / "latency" / "summary.json"
+    if path.is_file():
+        summary = json.loads(path.read_text())
+        for metric, name, title, ylabel, configs, log in (
+                ("itl_p50_ms", "itl_vs_length", "Decode time per token vs context length (budget 1024)",
+                 "ITL p50 (ms)", ["E0_full", "E2_s1_metal", "E4_hsa_metal"], False),
+                ("ttft_ms", "ttft_vs_length", "Time to first token vs context length (budget 1024)",
+                 "TTFT (ms, log scale)", list(LATENCY_NAMES), True)):
+            fig, ax = plt.subplots(figsize=(6.4, 3.8))
+            for config in configs:
+                rows = sorted((s for s in summary if s["config"] == config), key=lambda s: s["length"])
+                if not rows:
+                    continue
+                color, marker = STYLE[config]
+                xs, ys = [r["length"] // 1024 for r in rows], [r[metric] for r in rows]
+                ax.plot(xs, ys, color=color, marker=marker, label=LATENCY_NAMES[config])
+                if metric == "itl_p50_ms" and config in ("E0_full", "E4_hsa_metal"):
+                    label_end(ax, xs[-1], ys[-1], f"{ys[-1]:.2f}")
+            ax.set_xscale("log", base=2)
+            ax.set_xticks([2, 4, 8, 16, 32], ["2k", "4k", "8k", "16k", "32k"])
+            if log:
+                ax.set_yscale("log")
+                ax.yaxis.set_major_locator(matplotlib.ticker.LogLocator(base=10, subs=(1, 2, 5)))
+                ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
+                ax.yaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+            else:
+                ax.set_ylim(bottom=0)
+            ax.set_xlabel("Context length (tokens)")
+            ax.set_ylabel(ylabel)
+            finish(fig, ax, name, title)
+
+    if (root / "ruler").is_dir():
+        by_length = ruler_by_length(records(root / "ruler"))
+        fig, ax = plt.subplots(figsize=(6.4, 3.8))
+        for run, label in (("off", "Full KV (E0)"), ("stage1_b1024", "Stage 1 (E2), 1024"),
+                           ("hsa_b1024", "Stage 1+2 (E4), 1024"), ("hsa_b512", "Stage 1+2 (E4), 512")):
+            if run not in by_length:
+                continue
+            color, marker = STYLE[RUN_CONFIG[run.split("_b")[0]]]
+            xs = sorted(by_length[run])
+            ax.plot([x // 1024 for x in xs], [by_length[run][x] for x in xs], color=color, marker=marker, label=label,
+                    linestyle="--" if run == "hsa_b512" else "-")
+        ax.set_xscale("log", base=2)
+        ax.set_xticks([2, 4, 8, 16, 32], ["2k", "4k", "8k", "16k", "32k"])
+        ax.set_ylim(0, 100)
+        ax.set_xlabel("Context length (tokens)")
+        ax.set_ylabel("RULER accuracy (%)")
+        finish(fig, ax, "ruler_vs_length", "RULER accuracy vs context length")
+
+        sweep = dict(records(root / "ruler"))
+        if (root / "ruler_budget").is_dir():
+            sweep.update(records(root / "ruler_budget"))
+        long = {run: mean(v for n, v in r.items() if n >= 16384) for run, r in ruler_by_length(sweep).items()}
+        fig, ax = plt.subplots(figsize=(6.4, 3.8))
+        for mode in ("stage1", "hsa"):
+            points = sorted((int(run.split("_b")[1]), v) for run, v in long.items()
+                            if run.startswith(mode + "_b") and v is not None)
+            if points:
+                color, marker = STYLE[RUN_CONFIG[mode]]
+                ax.plot([b for b, _ in points], [v for _, v in points], color=color, marker=marker,
+                        label=NAMES[mode])
+        if long.get("off") is not None:
+            ax.axhline(long["off"], color=STYLE["E0_full"][0], linewidth=2, label="Full KV (E0)")
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("Token budget")
+        ax.set_ylabel("RULER accuracy at 16k-32k (%)")
+        ax.set_ylim(0, 100)
+        finish(fig, ax, "accuracy_vs_budget", "Accuracy vs token budget (RULER 16k and 32k)")
+
+    runs = root / "latency_long" / "runs"
+    if runs.is_dir():
+        series = {}
+        for path in runs.glob("E*_32768_*.json"):
+            r = json.loads(path.read_text())
+            series.setdefault(r["config"], []).append(r["metrics"]["decode_step_ms"])
+        if series:
+            fig, ax = plt.subplots(figsize=(6.4, 3.8))
+            for config in [c for c in LATENCY_NAMES if c in series]:
+                steps = [statistics.median(s[i] for s in series[config]) for i in range(1, len(series[config][0]))]
+                window = 32
+                smooth = [statistics.median(steps[max(0, i - window):i + 1]) for i in range(len(steps))]
+                color, _ = STYLE[config]
+                ax.plot(range(2, len(steps) + 2), smooth, color=color, label=LATENCY_NAMES[config])
+            ax.set_xlabel("Decode step")
+            ax.set_ylabel("ITL (ms, rolling median of 32)")
+            finish(fig, ax, "itl_long_generation", "Decode time per token over a 1024-token generation (32k input)")
+    return links
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("root", type=Path)
@@ -194,6 +317,9 @@ def main():
     for part in (accuracy_section, consistency_section, latency_section, long_generation_section):
         sections += part(args.root)
     text = "\n".join(sections)
+    links = figures(args.root)
+    if links:
+        text += "\n## Figures\n\n" + "\n\n".join(links) + "\n"
     (args.root / "report.md").write_text(text + "\n")
     print(text)
 

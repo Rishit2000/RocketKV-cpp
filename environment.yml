@@ -23,3 +23,5 @@ dependencies:
       - pyyaml
       - html2text
       - beautifulsoup4
+      # report figures
+      - matplotlib
