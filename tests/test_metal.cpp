@@ -690,6 +690,9 @@ int main(int argc, char **argv) {
         compare(metal, 128, 513, 3, 17, true);
         compare(metal, 64, 257, 3, 17, false, true);
         compare(metal, 64, 257, 3, 257);
+        // Selections whose last attention block gets no tokens (k = 600, 650, 656 split over 64 slices).
+        for (int topk : {600, 650, 656}) compare(metal, 128, 1300, 1, topk);
+        for (int topk : {600, 656}) compare(metal, 128, 1300, 2, topk);
         compare(metal, 96, 129, 2, 23);
         compare(metal, 256, 17, 2, 5);
         compare(metal, 16, 32768, 3, 17, true);

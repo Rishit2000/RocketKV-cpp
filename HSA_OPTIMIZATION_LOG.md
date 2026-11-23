@@ -852,3 +852,7 @@ HSA F6 相对 F1 下降 10.6–18.0%，相对起点 F0 下降 21–28%；32K 下
 ### 精度门槛
 
 RULER 5 任务 × 10 条 @8K，HSA budget 1024：F0 与 F6 的 50 条生成完全一致（50/50），各任务分数相同（均值 69.87）。`ROCKET_TEST_METAL=1 scripts/stage2.sh test` 全部通过（14 项集成测试 + Metal 单测）。
+
+### 修复：空 attention 块产生 NaN（benchmark 中发现）
+
+`attend` 把 k 个选中 token 均分成 64 段（每段 `ceil(k/64)` 个），4 段一个块。当 `ceil(k/64) × 60 ≥ k`（如 k = 600、650、656，对应 2K 输入、budget ≥ 1200）时最后一个块没有 token，块内合并的 `exp(-inf - (-inf))` 使分母为 NaN，最终合并 `0 × NaN` 仍是 NaN，runner 报 “Non-finite Metal HSA output” 并退出。修复：块内合并跳过 m = -inf 的 simdgroup。非空块的算术逐位不变（被跳过的项原本为 0），所以此前完成的结果不受影响；出错的情况此前都会直接报错而非静默产生错误结果。`test_metal` 增加 k = 600/650/656 的用例（修复前失败）。bench 不变（8K：2.52 ms）。

@@ -467,7 +467,10 @@ kernel void attend(ARGS, constant uint &units [[buffer(16)]], uint tid [[thread_
     for (uint g = 0; g < nh; ++g) {
         float top = -INFINITY, sum = 0;
         for (uint i = 0; i < sgs; ++i) top = max(top, stats[(i * MAX_GROUP + g) * 2]);
-        for (uint i = 0; i < sgs; ++i) sum += exp(stats[(i * MAX_GROUP + g) * 2] - top) * stats[(i * MAX_GROUP + g) * 2 + 1];
+        for (uint i = 0; i < sgs; ++i) {
+            float mi = stats[(i * MAX_GROUP + g) * 2];
+            if (mi != -INFINITY) sum += exp(mi - top) * stats[(i * MAX_GROUP + g) * 2 + 1];
+        }
         m[g] = top == -INFINITY ? 0.0f : exp(m[g] - top);  // this simdgroup's weight
         l[g] = top;
         if (sg == 0 && lane == 0) total[g] = sum;
