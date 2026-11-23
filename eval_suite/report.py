@@ -284,6 +284,8 @@ def figures(root):
         if long.get("off") is not None:
             ax.axhline(long["off"], color=STYLE["E0_full"][0], linewidth=2, label="Full KV (E0)")
         ax.set_xscale("log", base=2)
+        budgets = sorted({int(run.split("_b")[1]) for run in long if "_b" in run})
+        ax.set_xticks(budgets, [str(b) for b in budgets])
         ax.set_xlabel("Token budget")
         ax.set_ylabel("RULER accuracy at 16k-32k (%)")
         ax.set_ylim(0, 100)
@@ -300,11 +302,11 @@ def figures(root):
             for config in [c for c in LATENCY_NAMES if c in series]:
                 steps = [statistics.median(s[i] for s in series[config]) for i in range(1, len(series[config][0]))]
                 window = 32
-                smooth = [statistics.median(steps[max(0, i - window):i + 1]) for i in range(len(steps))]
+                smooth = [statistics.fmean(steps[max(0, i - window + 1):i + 1]) for i in range(len(steps))]
                 color, _ = STYLE[config]
                 ax.plot(range(2, len(steps) + 2), smooth, color=color, label=LATENCY_NAMES[config])
             ax.set_xlabel("Decode step")
-            ax.set_ylabel("ITL (ms, rolling median of 32)")
+            ax.set_ylabel("ITL (ms, rolling mean of 32 steps)")
             finish(fig, ax, "itl_long_generation", "Decode time per token over a 1024-token generation (32k input)")
     return links
 
