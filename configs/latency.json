@@ -1,0 +1,30 @@
+{
+  "_comment": "Decode/TTFT latency for the five benchmark configurations (docs/xiang/benchmark_plan.md): E0 full KV, E1/E2 Stage 1 on CPU/Metal, E3/E4 Stage 1 + Stage 2 (HSA) on CPU/Metal. Prompts: official RULER niah_single_2 inputs; output fixed at max_tokens with --ignore-eos.",
+  "model": {
+    "path": "models/Llama-3.2-3B-Instruct-Q8_0.gguf",
+    "tokenizer": "models/Llama-3.2-3B-Instruct-tokenizer",
+    "runner": "./build/runner"
+  },
+  "latency": {
+    "task": "niah_single_2",
+    "lengths": [2048, 4096, 8192, 16384, 32768],
+    "prompts": 2,
+    "repeats": 3,
+    "max_tokens": 128,
+    "configs": [
+      {"name": "E0_full", "mode": "off"},
+      {"name": "E1_s1_cpu", "mode": "stage1", "stage1_backend": "cpu"},
+      {"name": "E2_s1_metal", "mode": "stage1", "stage1_backend": "metal"},
+      {"name": "E3_hsa_cpu", "mode": "hsa", "stage1_backend": "cpu", "stage2_backend": "cpu-reference"},
+      {"name": "E4_hsa_metal", "mode": "hsa", "stage1_backend": "metal", "stage2_backend": "metal"}
+    ]
+  },
+  "attention": {
+    "budget": 1024,
+    "window_size": 32,
+    "kernel_size": 63
+  },
+  "management": {
+    "data_dir": "data"
+  }
+}

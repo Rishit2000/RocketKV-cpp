@@ -60,15 +60,18 @@ bash scripts/data/prepare_ruler.sh      # official RULER inputs in data/ruler/<l
 |---|---|---|
 | LongBench | `bash scripts/eval/longbench.sh results/longbench_32k` | 16 English tasks, all samples, middle-truncated to 32k tokens |
 | RULER | `bash scripts/eval/ruler.sh results/ruler_5task` | `niah_single_2`, `niah_multikey_2`, `vt`, `fwe`, `qa_1`; 10 samples each at 2k/4k/8k/16k/32k |
+| Latency | `bash scripts/eval/latency.sh results/latency` | Full KV, Stage 1 and Stage 1+2 on CPU and Metal; RULER prompts at 2k-32k, 128 tokens (`--ignore-eos`), interleaved repeats |
+| Long decode | `bash scripts/eval/latency_long.sh results/latency_long` | Full KV, Stage 1, Stage 1+2 (Metal); 1024 tokens at 8k and 32k |
+| Benchmark | `bash scripts/eval/benchmark.sh results/bench` | All of the above at the scale of `docs/xiang/benchmark_plan.md`, then `report.md` (`scripts/eval/report.sh`) |
 
-Each command runs full KV once, then `stage1` and `hsa` for every budget in the config (512, 1024, 2048), with Metal Stage 1 scoring and Metal HSA. Add `--mode hsa`, `--budget 1024`, or `--dry-run` (load and format every input, print the plan, run nothing) after the output directory.
+The accuracy commands run full KV once, then `stage1` and `hsa` for every budget in the config (512, 1024, 2048), with Metal Stage 1 scoring and Metal HSA. After the output directory, add `--mode stage1 hsa`, `--budget 1024`, `--stage1-backend cpu`, `--stage2-backend cpu-reference`, `--num-samples N`, `--context-lens ...`, or `--dry-run` (load and format every input, print the plan, run nothing).
 
 Prompts and scores follow the RocketKV paper code. LongBench prompts are middle-truncated with the HF tokenizer and wrapped in the llama3 chat template, except `trec`, `triviaqa`, `samsum`, `lcc`, and `repobench-p`; scoring is LongBench's `scorer()`. RULER inputs are used as generated (llama3 template and answer prefix included); every task generates up to 128 tokens and is scored with RULER's `string_match_all` (`string_match_part` for `qa_*`). As in RocketKV, chat-formatted prompts start with two BOS tokens. Differences from the paper are recorded in each config's `_comment`.
 
 ## Read and resume a run
 
 - `status.json` shows progress; `summary.json` reports scores and timings per run (`off`, `stage1_b1024`, ...) and task (`<len>/<task>` for RULER).
-- Each sample has a scored checkpoint and runner log. Wall time includes model startup; `ttft_ms` and `decode_ms_per_forward` measure inference. KV size is a logical estimate.
+- Each sample has a scored checkpoint and runner log. Wall time includes model startup; `ttft_ms`, `first_decode_ms` and `decode_step_ms` (one entry per decode forward) measure inference. KV size is a logical estimate.
 - Re-run the same command to resume. The driver checks `manifest.json` against the inputs, settings, binary, driver hash, and Git commit. Use a new directory when these change.
 
 For samples that evict prompt tokens, the dual-Metal run requires `stage1_capture=metal` and `stage1_capture_host_bytes=0`. For HSA it checks `stage2_layer_calls == model_layers * decode_forward_calls`. The first output token comes from prefill logits.

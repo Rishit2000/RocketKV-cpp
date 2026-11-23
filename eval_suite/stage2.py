@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable LongBench / RULER comparison: full KV, Stage 1, and Stage 1 + Metal HSA.
+"""Resumable LongBench / RULER comparison: full KV, Stage 1, and Stage 1 + Stage 2 (HSA).
 
 Prompts and scoring follow the RocketKV paper code (NVlabs/RocketKV):
   LongBench  raw prompt middle-truncated to context_len HF tokens, llama3 chat template
@@ -84,7 +84,7 @@ def score(suite, task, record, sample):
     return score_longbench_sample(task, record["generated"], sample["answers"], sample.get("all_classes"))
 
 
-def check_backends(m, mode, stage1_backend):
+def check_backends(m, mode, stage1_backend, stage2_backend):
     if m["effective_mode"] != mode:
         raise RuntimeError("Runner used the wrong mode")
     if mode != "off" and stage1_backend == "metal":
@@ -95,31 +95,39 @@ def check_backends(m, mode, stage1_backend):
             or m["stage1_capture_metal_calls"] < 1 or m["stage1_capture_host_bytes"] != 0
         ):
             raise RuntimeError("Stage 1 eviction did not use GPU-resident Metal capture and scoring")
-    if mode == "hsa" and (m["stage2_backend"] != "metal" or m["model_backend"] != "metal" or
+    if mode == "hsa" and (m["stage2_backend"] != stage2_backend or m["model_backend"] != "metal" or
                           m["stage2_layer_calls"] != m["model_layers"] * m["decode_forward_calls"]):
-        raise RuntimeError("Metal HSA did not execute in every layer")
+        raise RuntimeError(f"{stage2_backend} HSA did not execute in every layer")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--mode", choices=("all", *MODES), default="all")
+    parser.add_argument("--mode", choices=("all", *MODES), nargs="+", default=["all"])
     parser.add_argument("--budget", type=int, nargs="+",
                         help="Token budgets for stage1/hsa (default: attention.budget in the config)")
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--stage1-backend", choices=("cpu", "metal"), default="cpu",
                         help="Stage 1 scoring backend for stage1 and hsa runs")
+    parser.add_argument("--stage2-backend", choices=("cpu-reference", "metal"), default="metal",
+                        help="Stage 2 (HSA) backend for hsa runs")
+    parser.add_argument("--num-samples", type=int, help="Override benchmark.num_samples (first N per task)")
+    parser.add_argument("--context-lens", type=int, nargs="+", help="Override benchmark.context_lens (RULER)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Load and format all inputs and print the plan; writes nothing")
     args = parser.parse_args()
     os.chdir(ROOT)
     config = load_config_file(args.config)
+    if args.num_samples is not None:
+        config["benchmark"]["num_samples"] = args.num_samples
+    if args.context_lens:
+        config["benchmark"]["context_lens"] = args.context_lens
     suite = config["benchmark"]["suite"]
     attention = config["attention"]
     budgets = args.budget or attention["budget"]
     budgets = budgets if isinstance(budgets, list) else [budgets]
-    modes = MODES if args.mode == "all" else (args.mode,)
+    modes = MODES if "all" in args.mode else tuple(m for m in MODES if m in args.mode)
     if not budgets or min(budgets) < 1 or args.threads < 1:
         raise ValueError("Budgets and thread count must be positive")
     # One run per (mode, budget); full KV ignores the budget and runs once.
@@ -164,7 +172,7 @@ def main():
         "units": [f"{g}/{t}" if g else t for g, t, _, _ in units],
         "samples_per_unit": {k: len(v) for k, v in samples.items()},
         "runs": [f"{m}" if b is None else f"{m}_b{b}" for m, b in runs],
-        "stage1_backend": args.stage1_backend, "hsa_backend": "metal",
+        "stage1_backend": args.stage1_backend, "hsa_backend": args.stage2_backend,
         "threads": args.threads, "gpu_layers": 99, "kv_type": "f16",
         "window_size": attention.get("window_size", 32), "kernel_size": attention.get("kernel_size", 63),
         "n_ctx_rule": f"context_len + max_tokens + {N_CTX_MARGIN}; runner truncation disabled (--context-len 0)",
@@ -212,7 +220,7 @@ def main():
                         source, target = directory / "input.json", directory / "pending.json"
                         save(source, request)
                         command = [str(runner), "--model", str(model), "--batch", str(source), "--output", str(target),
-                                   "--rocket-mode", mode, "--stage2-backend", "metal" if mode == "hsa" else "cpu-reference",
+                                   "--rocket-mode", mode, "--stage2-backend", args.stage2_backend if mode == "hsa" else "cpu-reference",
                                    "--kv-type", "f16", "--gpu-layers", "99", "--threads", str(args.threads),
                                    "--budget", str(budget or budgets[0]), "--n-ctx", str(n_ctx), "--context-len", "0",
                                    "--window-size", str(manifest["window_size"]), "--kernel-size", str(manifest["kernel_size"])]
@@ -226,7 +234,7 @@ def main():
                         if len(results) != 1 or results[0]["sample_id"] != sample["sample_id"] or results[0]["status"] != "ok":
                             raise RuntimeError("Runner returned a failed or mismatched sample")
                         record = results[0]
-                        check_backends(record["metrics"], mode, args.stage1_backend)
+                        check_backends(record["metrics"], mode, args.stage1_backend, args.stage2_backend)
                         record.update(task=task, group=group, budget=budget, references=sample["answers"], wall_seconds=wall,
                                       score=score(suite, task, record, sample))
                         save(checkpoint, record)

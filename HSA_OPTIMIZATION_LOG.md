@@ -829,6 +829,7 @@ elif sys.argv[1]=='compare':compare(sys.argv[2],sys.argv[3],list(map(int,sys.arg
 | F4 | 每层 2 次 dispatch：`score`（宽网格，块内重算 top-r 维度，最后到达的块做 softmax+选择）+ `attend`（最后到达的块合并）；跨 TG 数据用 `coherent(device)` + acquire/release fence | 4.21 | 中间版本：合并阶段单 TG 串行读 64 个 partial（≈1.9 ms） |
 | F5 | F4 + 每块内先在 threadgroup 内存合并 4 个 simdgroup，最后一块只合并 ≤16 个 partial；slot 预取后 `simd_shuffle` 广播 | 2.73 | 保留 |
 | F6 | F5 + 8-bit radix（4 轮，simdgroup 前缀和找桶）+ 合并统计量并行装入 threadgroup 内存 + 每 chunk 4 lanes 计算近似分数 | 2.48 | 保留（8 lanes/chunk 在 budget 2048 的 16K/32K 回退，撤回） |
+| F7 | F6 + 每块先归约逐头 (max, Σexp)，最后一块只合并块统计量（省去两遍全量读取）+ 解码内核用 `fast::exp` | 2.45 | 撤回：budget 1024 下 8K/16K 仅 −1.3%/−1.4%（budget 2048 为 −3~5%），低于 2% 门槛 |
 
 F6 的 bench（ms，28 层，2K/8K/16K/32K）：budget 1024 为 2.66/2.48/2.67/2.48；budget 2048 为 2.85/3.28/3.28/3.34（起点 6.42/7.64/7.70/7.79）。
 
