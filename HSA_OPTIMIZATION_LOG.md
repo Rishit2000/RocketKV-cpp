@@ -805,3 +805,49 @@ elif sys.argv[1]=='compare':compare(sys.argv[2],sys.argv[3],list(map(int,sys.arg
 </details>
 
 输入样本文件 SHA-256：`5aa7b81a0e705aa9a529dd07969f9c722763b8b0a51f5d46fd9401daa8eb4c01`。
+
+## 第二轮：M5 Ultra，任务精度不变口径（2026-11-23，分支 `xiang/hsa-fusion`）
+
+- 环境：Apple M5 Ultra（64 核 GPU）；Llama-3.2-3B-Instruct-Q8_0；F16 KV；全 GPU offload；16 threads；budget=1024；Stage 1 Metal。
+- 数值口径改为“任务精度不变”：允许重排浮点归约；算法语义不变（逐头 chunk softmax、GQA 组求和、按 token 数加权的 top-k、按时间顺序、只对选中 token 做精确 attention）。Metal 单测改为：选择与 CPU 召回率均值 ≥ 0.98、最小 ≥ 0.90，输出与“Metal 自身选择上的 fp64 attention”误差 ≤ 1e-3·(1+|ref|)；并列/退化输入仍要求选择完全一致。
+- 内核口径：`build/test_metal bench`，28 层、Llama-3.2-3B 形状、每步追加一个候选，200 步中位数（无模型）。
+- 模型口径：RULER niah_single_2 第 1 条，`--ignore-eos` 64 步，`decode_step_ms[2:]` 中位数，多个 runner 交替运行，取各 trial 中位数。
+- 归因：仅在 a106 的一次性副本中通过环境变量跳过 dispatch / 在内核中提前返回，不提交。
+
+### 内核归因（起点，8K，28 层合计 5.30 ms）
+
+去掉 barrier 后 1.75 ms，但这会让相互依赖的层重叠，不能当下界。逐项跳过：prepare（bitonic 排序）≈1.0 ms，approximate ≈0.9 ms，select ≈0.8 ms，weighted_sum/exact 串行循环为主要剩余项。
+
+### 实验
+
+| 编号 | 改动 | bench 8K（ms，28 层） | 决定 |
+|---|---|---:|---|
+| F0 | 起点：9 个 kernel/层 | 5.30 | — |
+| F1 | split-K `attend`（每 simdgroup 在线 softmax，GQA 组内 3 头共享 K/V 读取）+ `combine`，替换 exact_scores/softmax/weighted_sum | 4.04 | 保留 |
+| F2 | 单 threadgroup/KV 头融合全部选择阶段 | 4.77 | 撤回：approximate 在 8 个 TG 中延迟受限（≈2.2 ms） |
+| F3 | prepare（rank 选维度，去掉 bitonic）/ approximate（宽网格）/ select 三个 kernel | 4.06 | 撤回：与 F1 持平 |
+| F4 | 每层 2 次 dispatch：`score`（宽网格，块内重算 top-r 维度，最后到达的块做 softmax+选择）+ `attend`（最后到达的块合并）；跨 TG 数据用 `coherent(device)` + acquire/release fence | 4.21 | 中间版本：合并阶段单 TG 串行读 64 个 partial（≈1.9 ms） |
+| F5 | F4 + 每块内先在 threadgroup 内存合并 4 个 simdgroup，最后一块只合并 ≤16 个 partial；slot 预取后 `simd_shuffle` 广播 | 2.73 | 保留 |
+| F6 | F5 + 8-bit radix（4 轮，simdgroup 前缀和找桶）+ 合并统计量并行装入 threadgroup 内存 + 每 chunk 4 lanes 计算近似分数 | 2.48 | 保留（8 lanes/chunk 在 budget 2048 的 16K/32K 回退，撤回） |
+
+F6 的 bench（ms，28 层，2K/8K/16K/32K）：budget 1024 为 2.66/2.48/2.67/2.48；budget 2048 为 2.85/3.28/3.28/3.34（起点 6.42/7.64/7.70/7.79）。
+
+### 模型级（ms/步）
+
+| 配置 | 2K | 8K | 16K | 32K |
+|---|---:|---:|---:|---:|
+| Full KV | 5.07 | 5.77 | 6.66 | 9.06 |
+| Stage 1（Metal） | 5.27 | 5.64 | 5.80 | 6.54 |
+| HSA 起点 F0 | 9.07 | 9.79 | 9.97 | 9.93 |
+| HSA F1 | 8.02 | 8.61 | 8.70 | 8.64 |
+| HSA F6 | 7.17 | 7.06 | 7.31 | 7.11 |
+
+HSA F6 相对 F1 下降 10.6–18.0%，相对起点 F0 下降 21–28%；32K 下比 Full KV 快 21.5%。Stage 1 在 8K 及以上快于 Full KV。
+
+### 主机开销（未改）
+
+一次性计时：`refresh_slots` 30 µs（8K）/ 60 µs（32K）每步；28 层编码合计约 142 µs 每步，多数与 GPU 执行重叠，约占步时 ≤3%，暂不优化。
+
+### 精度门槛
+
+RULER 5 任务 × 10 条 @8K，HSA budget 1024：F0 与 F6 的 50 条生成完全一致（50/50），各任务分数相同（均值 69.87）。`ROCKET_TEST_METAL=1 scripts/stage2.sh test` 全部通过（14 项集成测试 + Metal 单测）。

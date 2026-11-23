@@ -19,18 +19,15 @@ enum Buffer {
     Slots,
     Query,
     Bounds,
-    Dimensions,
-    Signs,
-    Scales,
     ChunkScores,
     TokenScores,
     Selected,
-    ExactScores,
+    Partials,
     Output,
     Error,
     BufferCount
 };
-enum Pipeline { Pack, Summarize, Prepare, Approximate, Softmax, Select, SelectLocal, Exact, WeightedSum,
+enum Pipeline { Score, Attend,
                 PrefillPack, PrefillDot, PrefillSoftmax, PrefillReduce, PrefillPool, PrefillCapture, PipelineCount };
 enum PrefillBuffer { PrefillQ, PrefillK, PrefillPackedK, PrefillLogits, PrefillGroups,
                      PrefillScores, PrefillError, PrefillRaw, PrefillBufferCount };
@@ -42,7 +39,7 @@ struct CaptureParams {
     uint32_t heads, tokens, offset, total, sd, sh, st, type, is_query;
 };
 struct Params {
-    uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded, dim_padded;
+    uint32_t dim, heads, kv_heads, count, chunk, rank, topk, chunks, padded;
     uint32_t qd, qh, kd, kt, kh, vd, vt, vh;
     uint32_t cached_count, mask_type, mask_stride, bounds_stride;
 };
@@ -82,6 +79,7 @@ struct RocketMetal::Impl {
     RocketConfig prefill_config{};
     RocketCaptureStats capture_stats{};
     int prefill_len_q = 0, captured_q = 0, captured_k = 0;
+    uint32_t score_threads = 0;
     bool capturing = false;
     ggml_backend_metal_get_tensor_buffer_t get_tensor_buffer = nullptr;
     ggml_backend_metal_set_custom_t set_custom = nullptr;
@@ -117,17 +115,18 @@ struct RocketMetal::Impl {
             throw metal_error("Cannot initialize Metal HSA", error);
         }
         NSArray<NSString *> *names = @[
-            @"pack", @"summarize", @"prepare", @"approximate", @"softmax", @"select_tokens", @"select_tokens_local", @"exact_scores",
-            @"weighted_sum", @"prefill_pack", @"prefill_dot", @"prefill_softmax",
+            @"score", @"attend", @"prefill_pack", @"prefill_dot", @"prefill_softmax",
             @"prefill_reduce", @"prefill_pool", @"prefill_capture"
         ];
         for (size_t i = 0; i < pipelines.size(); ++i) {
             pipelines[i] = [device newComputePipelineStateWithFunction:[library newFunctionWithName:names[i]]
                                                                  error:&error];
-            if (!pipelines[i] || pipelines[i].maxTotalThreadsPerThreadgroup < 256) {
-                throw metal_error("Metal HSA requires 256 threads per threadgroup", error);
+            if (!pipelines[i] || pipelines[i].maxTotalThreadsPerThreadgroup < (i == Attend ? 128 : 256) ||
+                (i <= Attend && pipelines[i].threadExecutionWidth != 32)) {
+                throw metal_error("Metal HSA pipeline does not support its threadgroup shape", error);
             }
         }
+        score_threads = uint32_t(std::min<NSUInteger>(1024, pipelines[Score].maxTotalThreadsPerThreadgroup) / 128 * 128);
     }
     template <size_t N>
     void reserve(std::array<id<MTLBuffer>, N> &buffers, size_t index, size_t bytes, const void *source = nullptr) {
@@ -378,10 +377,10 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         if (!q || !k || !v || !q->data || !k->data || !v->data || (!output && !dst) || q->type != GGML_TYPE_F32 ||
             k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || cfg.dim_head < 1 || cfg.dim_head > 256 ||
             cfg.num_heads_kv < 1 || cfg.num_heads < 1 || cfg.num_heads % cfg.num_heads_kv ||
-            cfg.num_heads / cfg.num_heads_kv > 256 || slots.empty() || slots.size() > 32768 ||
+            cfg.num_heads / cfg.num_heads_kv > 8 || slots.empty() || slots.size() > 32768 ||
             cfg.chunk_size < 1 || cfg.r_dim < 1 || cfg.topk_decode < 1 || layer < -1) {
             throw std::invalid_argument(
-                "Metal HSA requires F32 Q/F16 KV, head dimension <=256 and 1..32768 candidates");
+                "Metal HSA requires F32 Q/F16 KV, head dimension <=256, <=8 query heads per KV head and 1..32768 candidates");
         }
         if (q->ne[0] != cfg.dim_head || q->ne[1] != 1 || q->ne[2] != cfg.num_heads || q->ne[3] != 1 ||
             k->ne[0] != cfg.dim_head || k->ne[2] != cfg.num_heads_kv || k->ne[3] != 1 ||
@@ -403,7 +402,6 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         p.topk = std::min(uint32_t(cfg.topk_decode), p.count);
         p.chunks = 1 + (p.count - 1) / p.chunk;
         p.padded = power_of_two(p.count);
-        p.dim_padded = power_of_two(p.dim);
         p.bounds_stride = p.chunk > 1 ? power_of_two(p.chunks) : 0;
         p.qd = stride(q->nb[0]);
         p.qh = stride(q->nb[2]);
@@ -453,16 +451,17 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
         m.reserve(buffers, Query, qbytes);
         m.reserve(buffers, Bounds, bounds_bytes);
         cache.bounds = buffers[Bounds];
-        m.reserve(buffers, Dimensions, size_t(p.kv_heads) * p.dim * sizeof(uint32_t));
-        m.reserve(buffers, Signs, size_t(p.kv_heads) * p.dim * sizeof(float));
-        m.reserve(buffers, Scales, p.heads * sizeof(float));
         m.reserve(buffers, ChunkScores, size_t(p.heads) * p.chunks * sizeof(float));
         m.reserve(buffers, TokenScores, size_t(p.kv_heads) * p.padded * sizeof(float));
         m.reserve(buffers, Selected, size_t(p.kv_heads) * p.padded * sizeof(uint32_t));
-        m.reserve(buffers, ExactScores, size_t(p.heads) * p.topk * sizeof(float));
+        // Split-K slices of the exact attention: about 8 selected tokens per simdgroup,
+        // 4 simdgroups per threadgroup, at most 64 slices so one threadgroup can merge them.
+        const uint32_t units = (std::min(64u, (p.topk + 7) / 8) + 3) / 4 * 4;
+        m.reserve(buffers, Partials, size_t(p.heads) * (units / 4) * (p.dim + 2) * sizeof(float));
         if (!native_encoder) m.reserve(buffers, Output, qbytes);
-        uint32_t zero = 0;
-        m.reserve(buffers, Error, sizeof(zero), &zero);
+        // Error word, then score and attend tickets per KV head.
+        const std::vector<uint32_t> zeros(1 + 2 * p.kv_heads, 0);
+        m.reserve(buffers, Error, zeros.size() * sizeof(uint32_t), zeros.data());
         id<MTLCommandBuffer> command = native_encoder ? nil : [m.queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = native_encoder ? (__bridge id<MTLComputeCommandEncoder>)native_encoder
                                                             : [command computeCommandEncoder];
@@ -494,38 +493,17 @@ void RocketMetal::run(const ggml_tensor *q, const ggml_tensor *k, const ggml_ten
             [encoder setBuffer:buffers[RawQ] offset:0 atIndex:18];
         }
         [encoder setBytes:&p length:sizeof(p) atIndex:0];
-        auto dispatch = [&](size_t kernel, uint32_t groups, uint32_t threads = 256) {
+        auto dispatch = [&](Pipeline kernel, uint32_t blocks, uint32_t threads) {
             [encoder setComputePipelineState:m.pipelines[kernel]];
-            [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+            [encoder dispatchThreadgroups:MTLSizeMake(blocks, p.kv_heads, 1)
                     threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         };
-        auto softmax = [&](uint32_t width, uint32_t exact_mode) {
-            [encoder setBytes:&width length:sizeof(width) atIndex:16];
-            [encoder setBytes:&exact_mode length:sizeof(exact_mode) atIndex:17];
-            dispatch(Softmax, p.heads);
-        };
-        dispatch(Pack, (std::max({p.heads * p.dim, p.kv_heads * (p.count - p.cached_count) * p.dim, p.count}) + 255) / 256);
-        if (p.topk < p.count) {
-            if (p.chunk > 1) {
-                const uint32_t updated_chunks = p.chunks - p.cached_count / p.chunk;
-                dispatch(Summarize, (updated_chunks * p.kv_heads * p.dim + 255) / 256);
-            }
-            dispatch(Prepare, p.kv_heads);
-            dispatch(Approximate, (p.heads * p.chunks + 255) / 256);
-            softmax(p.chunks, 0);
-        }
-        const size_t selection_bytes = ((size_t(p.chunks) + 3) / 4) * 16;
-        if (p.topk < p.count && selection_bytes + m.pipelines[SelectLocal].staticThreadgroupMemoryLength <= m.device.maxThreadgroupMemoryLength) {
-            [encoder setThreadgroupMemoryLength:selection_bytes atIndex:0];
-            dispatch(SelectLocal, p.kv_heads);
-            [encoder setThreadgroupMemoryLength:0 atIndex:0];
-        } else {
-            dispatch(Select, p.kv_heads);
-        }
-        dispatch(Exact, (p.heads * p.topk + 255) / 256);
-        softmax(p.topk, 1);
-        dispatch(WeightedSum, (p.heads * p.dim + 63) / 64, 64);
+        // Blocks of score_threads / 4 chunks per KV head (one block when every candidate is selected).
+        const uint32_t per_block = m.score_threads / 4;
+        dispatch(Score, p.topk < p.count ? (p.chunks + per_block - 1) / per_block : 1, m.score_threads);
+        [encoder setBytes:&units length:sizeof(units) atIndex:16];
+        dispatch(Attend, units / 4, 128);
         if (!native_encoder) {
             [encoder endEncoding];
             [command commit];
