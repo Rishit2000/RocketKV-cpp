@@ -142,10 +142,11 @@ def run_evaluation(
             total_prefill_ms = 0.0
             total_compute_ms = 0.0
             total_kept_tokens = 0
-            total_decode_spd = 0.0
+            total_decode_tokens = 0
+            total_decode_ms = 0.0
             total_peak_memory = 0.0
+            max_peak_memory = 0.0
             total_bandwidth = 0.0
-            decode_count = 0
 
             for idx, (res_item, sample) in enumerate(zip(results_list, samples)):
                 generated = res_item.get("generated", "")
@@ -162,30 +163,31 @@ def run_evaluation(
                 p_tokens = metrics.get("prompt_tokens", len(sample["prompt"]) // 4)
                 pref_ms = metrics.get("prefill_ms", metrics.get("ttft_ms", 0.0))
                 dec_tokens = metrics.get("decode_tokens", 0)
-                tok_per_sec = metrics.get("tokens_per_sec", 0.0)
+                dec_ms = metrics.get("decode_time_ms", (dec_tokens * metrics.get("ms_per_token", 0.0)))
+                peak_mem = metrics.get("peak_memory_mb", metrics.get("peak_rss_mb", 0.0))
 
                 total_score += score
                 total_ttft += metrics.get("ttft_ms", 0.0)
                 total_prompt_tokens += p_tokens
                 total_prefill_ms += pref_ms
-                total_compute_ms += metrics.get("compute_time_ms", (pref_ms + metrics.get("evict_ms", 0.0) + (dec_tokens * metrics.get("ms_per_token", 0.0))))
+                total_compute_ms += metrics.get("compute_time_ms", (pref_ms + metrics.get("evict_ms", 0.0) + dec_ms))
                 total_kept_tokens += metrics.get("kept_tokens", p_tokens)
                 total_kv_mb += metrics.get("kv_cache_mb", 0.0)
                 total_uncompressed_mb += metrics.get("uncompressed_kv_cache_mb", 0.0)
                 total_evict_ms += metrics.get("evict_ms", 0.0)
-                total_peak_memory += metrics.get("peak_memory_mb", metrics.get("peak_rss_mb", 0.0))
+                total_decode_tokens += dec_tokens
+                total_decode_ms += dec_ms
+                total_peak_memory += peak_mem
+                if peak_mem > max_peak_memory:
+                    max_peak_memory = peak_mem
                 total_bandwidth += metrics.get("effective_bandwidth_gbs", 0.0)
-
-                if dec_tokens > 0 and tok_per_sec > 0:
-                    total_decode_spd += tok_per_sec
-                    decode_count += 1
 
             n = len(samples)
             avg_score = (total_score / n) * 100.0 if n > 0 else 0.0
             avg_ttft = total_ttft / n if n > 0 else 0.0
             avg_prefill_spd = (total_prompt_tokens / (total_prefill_ms / 1000.0)) if total_prefill_ms > 0 else 0.0
-            avg_tokens_per_sec = (total_decode_spd / decode_count) if decode_count > 0 else 0.0
-            avg_decode_ms = (1000.0 / avg_tokens_per_sec) if avg_tokens_per_sec > 0 else 0.0
+            avg_tokens_per_sec = (total_decode_tokens / (total_decode_ms / 1000.0)) if total_decode_ms > 0 else 0.0
+            avg_decode_ms = (total_decode_ms / total_decode_tokens) if total_decode_tokens > 0 else 0.0
             avg_compute_ms = total_compute_ms / n if n > 0 else 0.0
             avg_kv_mb = total_kv_mb / n if n > 0 else 0.0
             avg_uncompressed_mb = total_uncompressed_mb / n if n > 0 else 0.0
@@ -196,7 +198,7 @@ def run_evaluation(
             avg_bandwidth = total_bandwidth / n if n > 0 else 0.0
             elapsed = time.time() - start_mode_time
 
-            print(f"  Completed {mode_name} in {elapsed:.1f}s. Final Accuracy: {avg_score:.2f}% | Avg Compute: {avg_compute_ms:.1f}ms | Peak Mem: {avg_peak_memory:.1f}MB")
+            print(f"  Completed {mode_name} in {elapsed:.1f}s. Final Accuracy: {avg_score:.2f}% | Avg Compute: {avg_compute_ms:.1f}ms | Peak Mem: {max_peak_memory:.1f}MB")
 
             task_results[mode_name] = {
                 "config": mode,
@@ -210,6 +212,7 @@ def run_evaluation(
                 "avg_kv_cache_mb": avg_kv_mb,
                 "uncompressed_kv_cache_mb": avg_uncompressed_mb,
                 "avg_peak_memory_mb": avg_peak_memory,
+                "max_peak_memory_mb": max_peak_memory,
                 "avg_effective_bandwidth_gbs": avg_bandwidth,
                 "avg_kept_tokens": avg_kept,
                 "avg_prompt_tokens": avg_prompt,
