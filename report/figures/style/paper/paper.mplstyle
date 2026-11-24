@@ -1,0 +1,33 @@
+# Mechanics that are not design tokens; every size and color comes from DESIGN.md through paper.use_design().
+font.family: sans-serif
+mathtext.fontset: custom
+# symbols Inter lacks (sqrt, sum, relations, \mathbb) use STIX Sans, which ships with matplotlib
+mathtext.fallback: stixsans
+mathtext.cal: STIXNonUnicode:italic
+# no Inter Bold Italic is bundled; without this matplotlib warns on every math label
+mathtext.bfit: sans:bold
+
+# a full box, with ticks sticking out of it
+axes.spines.top: True
+axes.spines.right: True
+axes.grid: True
+axes.grid.axis: both
+axes.axisbelow: True
+
+# filled markers in the line's color; their edge color is a token
+lines.markerfacecolor: auto
+
+# box plots: the box is filled with its series color; outline colors are tokens
+boxplot.patchartist: True
+boxplot.flierprops.marker: o
+
+legend.fancybox: False
+legend.framealpha: 1
+
+figure.constrained_layout.use: True
+figure.constrained_layout.hspace: 0
+figure.constrained_layout.wspace: 0
+
+savefig.dpi: 300
+# embedded TrueType (never Type 3, which venues reject); PDF text stays selectable text
+pdf.fonttype: 42
