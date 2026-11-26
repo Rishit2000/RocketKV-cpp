@@ -15,7 +15,7 @@ rocket_metal.o: rocket_metal.mm rocket_metal.h
 test_rocket_metal: test_rocket_metal.cpp rocket.cpp rocket_metal.o
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-runner: runner.cpp rocket.cpp rocket_metal.o
+runner: runner.cpp
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 clean:
